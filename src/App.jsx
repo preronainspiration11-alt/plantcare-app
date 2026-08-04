@@ -621,13 +621,48 @@ function AssetInsightsPage() {
 }
 
 function UsersPage() {
-  const { users, rUsers } = useApp()
+  const { users, profile, rUsers } = useApp()
   const ROLES = { admin: 'Administrator', manager: 'Maintenance Manager', technician: 'Technician' }
+  const PLANTS = [{ id: 'p1', name: 'Uluberia' }, { id: 'p2', name: 'Manpura' }, { id: 'p3', name: 'Haridwar' }]
+  const [adding, setAdding] = useState(false)
+  const [f, setF] = useState({ email: '', password: '', name: '', role: 'technician', plant_id: profile?.plant_id || 'p1' })
+  const [busy, setBusy] = useState(false)
+  const [msg, setMsg] = useState('')
   const setRole = async (u, role) => { await supabase.from('profiles').update({ role }).eq('id', u.id); await rUsers() }
+  const create = async () => {
+    if (!f.email || !f.password || !f.name) { setMsg('Email, password and name are required.'); return }
+    if (f.password.length < 6) { setMsg('Password must be at least 6 characters.'); return }
+    setBusy(true); setMsg('')
+    try {
+      const { data: { session } } = await supabase.auth.getSession()
+      const res = await fetch('https://itzkbcwyxrvldvkgxcfa.supabase.co/functions/v1/create-user', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${session.access_token}` },
+        body: JSON.stringify(f),
+      })
+      const out = await res.json()
+      if (!res.ok) { setMsg(out.error || 'Failed.'); setBusy(false); return }
+      await rUsers()
+      setAdding(false)
+      setF({ email: '', password: '', name: '', role: 'technician', plant_id: profile?.plant_id || 'p1' })
+    } catch (e) { setMsg(String(e.message || e)) }
+    setBusy(false)
+  }
   return (
-    <div className="p-6"><h1 className="text-xl font-black mb-4">Users &amp; permissions</h1><Note variant="amber">Adding new users needs email auth enabled in Supabase. For now you can view users and change their roles.</Note><Card>{users.map(u => <div key={u.id} className="flex items-center gap-3 px-4 py-3 border-t border-slate-100 flex-wrap"><div className="w-8 h-8 rounded-full text-white text-xs font-bold flex items-center justify-center flex-shrink-0" style={{ background: u.color || '#0F766E' }}>{u.initials || '?'}</div><div className="flex-1 min-w-0"><div className="font-bold text-sm">{u.name}</div><div className="text-xs text-slate-400">{u.user_group || '—'}</div></div><Select value={u.role} onChange={e => setRole(u, e.target.value)} className="w-auto">{Object.entries(ROLES).map(([k, v]) => <option key={k} value={k}>{v}</option>)}</Select></div>)}</Card></div>
+    <div className="p-6">
+      <div className="flex items-center gap-3 mb-4"><h1 className="text-xl font-black">Users &amp; permissions</h1><div className="flex-1" />{profile?.role === 'admin' && <Btn variant="teal" onClick={() => { setAdding(true); setMsg('') }}>+ Add user</Btn>}</div>
+      <Card>{users.map(u => <div key={u.id} className="flex items-center gap-3 px-4 py-3 border-t border-slate-100 flex-wrap"><div className="w-8 h-8 rounded-full text-white text-xs font-bold flex items-center justify-center flex-shrink-0" style={{ background: u.color || '#0F766E' }}>{u.initials || '?'}</div><div className="flex-1 min-w-0"><div className="font-bold text-sm">{u.name}{u.id === profile?.id ? ' (you)' : ''}</div><div className="text-xs text-slate-400">{u.email || '—'}</div></div><Select value={u.role} onChange={e => setRole(u, e.target.value)} className="w-auto">{Object.entries(ROLES).map(([k, v]) => <option key={k} value={k}>{v}</option>)}</Select></div>)}</Card>
+      {adding && <Modal title="Add user" onClose={() => setAdding(false)} maxWidth="max-w-md" footer={<><Btn variant="line" onClick={() => setAdding(false)}>Cancel</Btn><Btn variant="teal" onClick={create} disabled={busy}>{busy ? 'Creating…' : 'Create user'}</Btn></>}>
+        {msg && <Note variant="red">{msg}</Note>}
+        <div className="mb-3"><Lbl>Full name</Lbl><Input value={f.name} onChange={e => setF(o => ({ ...o, name: e.target.value }))} placeholder="e.g. Ramesh Kumar" /></div>
+        <div className="mb-3"><Lbl>Email (login ID)</Lbl><Input type="email" value={f.email} onChange={e => setF(o => ({ ...o, email: e.target.value }))} placeholder="ramesh@itc.in" /></div>
+        <div className="mb-3"><Lbl>Password (min 6 chars)</Lbl><Input type="text" value={f.password} onChange={e => setF(o => ({ ...o, password: e.target.value }))} placeholder="starter password" /></div>
+        <div className="grid grid-cols-2 gap-3"><Field label="Plant"><Select value={f.plant_id} onChange={e => setF(o => ({ ...o, plant_id: e.target.value }))}>{PLANTS.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</Select></Field><Field label="Role"><Select value={f.role} onChange={e => setF(o => ({ ...o, role: e.target.value }))}>{Object.entries(ROLES).map(([k, v]) => <option key={k} value={k}>{v}</option>)}</Select></Field></div>
+      </Modal>}
+    </div>
   )
 }
+
 function CalendarPage() {
   const { workOrders, assets } = useApp()
   const [y, setY] = useState(new Date().getFullYear())
