@@ -11,7 +11,7 @@ const supabase = createClient(
 )
 
 // Hardcoded admin (no login for now). Swap for real auth later.
-const PROFILE = { id: '1a29fe6b-6cb9-45c8-94aa-40e0f23c8b3a', plant_id: 'p1', name: 'Plant Admin', role: 'admin', initials: 'PA', color: '#0F766E' }
+
 const TODAY = () => new Date().toISOString().slice(0, 10)
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -103,6 +103,7 @@ const Ctx = createContext(null)
 const useApp = () => useContext(Ctx)
 
 function AppProvider({ children }) {
+  const [profile, setProfile] = useState(null)
   const [assets, setAssets] = useState([])
   const [workOrders, setWorkOrders] = useState([])
   const [users, setUsers] = useState([])
@@ -115,7 +116,12 @@ function AppProvider({ children }) {
   const [loading, setLoading] = useState(true)
   const [err, setErr] = useState('')
 
-  const perms = { viewAll: true, edit: true, create: true, approve: true, manageAssets: true, manageTG: true, manageUsers: true }
+  const role = profile?.role || 'technician'
+  const perms = {
+    viewAll: role !== 'technician', edit: role !== 'technician', create: role !== 'technician',
+    approve: ['admin', 'manager'].includes(role), manageAssets: ['admin', 'manager'].includes(role),
+    manageTG: ['admin', 'manager'].includes(role), manageUsers: role === 'admin',
+  }
 
   const rWOs = useCallback(async () => { try { setWorkOrders(await qWorkOrders()) } catch (e) { setErr(e.message) } }, [])
   const rAssets = useCallback(async () => { try { setAssets(await qAssets()) } catch (e) { setErr(e.message) } }, [])
@@ -127,18 +133,97 @@ function AppProvider({ children }) {
   const rPReqs = useCallback(async () => { try { setPurchReqs(await qPurchReqs()) } catch (e) { setErr(e.message) } }, [])
 
   const refreshAll = useCallback(async () => {
-    setLoading(true)
     await Promise.all([rWOs(), rAssets(), rUsers(), rTGs(), rProjects(), rScheds(), rWReqs(), rPReqs()])
-    setLoading(false)
   }, [])
 
-  useEffect(() => { refreshAll() }, [])
+  useEffect(() => {
+    let active = true
+    async function boot(session) {
+      if (!session) { if (active) { setProfile(null); setLoading(false) }; return }
+      setLoading(true)
+      const { data: prof } = await supabase.from('profiles').select('*').eq('id', session.user.id).single()
+      if (!active) return
+      setProfile(prof)
+      await refreshAll()
+      if (active) setLoading(false)
+    }
+    supabase.auth.getSession().then(({ data: { session } }) => boot(session))
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_e, session) => boot(session))
+    return () => { active = false; subscription.unsubscribe() }
+  }, [])
 
   return (
-    <Ctx.Provider value={{ profile: PROFILE, perms, loading, err, flash, setFlash, assets, workOrders, users, taskGroups, projects, schedules, workReqs, purchReqs, rWOs, rAssets, rUsers, rTGs, rProjects, rScheds, rWReqs, rPReqs, refreshAll }}>
+    <Ctx.Provider value={{ profile, perms, loading, err, flash, setFlash, assets, workOrders, users, taskGroups, projects, schedules, workReqs, purchReqs, rWOs, rAssets, rUsers, rTGs, rProjects, rScheds, rWReqs, rPReqs, refreshAll }}>
       {children}
     </Ctx.Provider>
   )
+}
+
+const PLANTS = [
+  { id: 'p1', name: 'Uluberia Plant', code: 'PCUB', loc: 'ITC PCPB · West Bengal', ic: '🏭', bg: '#CCFBF1' },
+  { id: 'p2', name: 'Manpura Plant', code: 'PCMP', loc: 'ITC PCPB · Himachal Pradesh', ic: '⚙️', bg: '#EDE9FE' },
+  { id: 'p3', name: 'Haridwar Plant', code: 'PCHD', loc: 'ITC PCPB · Uttarakhand', ic: '🔧', bg: '#FEF3C7' },
+]
+function LoginScreen() {
+  const [plantId, setPlantId] = useState(null)
+  const [email, setEmail] = useState('')
+  const [pw, setPw] = useState('')
+  const [err, setErr] = useState('')
+  const [busy, setBusy] = useState(false)
+  const pl = PLANTS.find(p => p.id === plantId)
+  const login = async () => {
+    if (!email || !pw) { setErr('Enter email and password.'); return }
+    setBusy(true); setErr('')
+    const { error } = await supabase.auth.signInWithPassword({ email, password: pw })
+    setBusy(false)
+    if (error) setErr(error.message)
+  }
+  if (!plantId) return (
+    <div className="min-h-screen flex items-center justify-center p-6 bg-gradient-to-br from-slate-900 to-teal-900">
+      <div className="w-full max-w-md">
+        <div className="flex items-center justify-center gap-3 mb-3"><div className="w-10 h-10 bg-teal-400 rounded-2xl flex items-center justify-center text-white font-black text-xl">P</div><div className="text-white text-2xl font-black">PlantCare <span className="text-teal-300">CMMS</span></div></div>
+        <p className="text-slate-400 text-center text-sm mb-8">ITC PCPB — Preventive Maintenance System</p>
+        <div className="bg-white rounded-2xl shadow-2xl p-6">
+          <div className="font-bold text-base mb-1">Choose your plant</div>
+          <p className="text-xs text-slate-400 mb-4">You'll only see your own plant's data.</p>
+          {PLANTS.map(p => <button key={p.id} onClick={() => setPlantId(p.id)} className="w-full flex items-center gap-4 p-4 border border-slate-200 rounded-2xl mb-3 text-left hover:border-teal-400 hover:bg-teal-50 transition-colors"><div className="w-11 h-11 rounded-xl flex items-center justify-center text-xl flex-shrink-0" style={{ background: p.bg }}>{p.ic}</div><div><div className="font-bold text-sm">{p.name}</div><div className="text-xs text-slate-400">{p.loc}</div></div><span className="ml-auto text-teal-600 font-black">→</span></button>)}
+        </div>
+      </div>
+    </div>
+  )
+  return (
+    <div className="min-h-screen flex items-center justify-center p-6 bg-gradient-to-br from-slate-900 to-teal-900">
+      <div className="w-full max-w-md">
+        <div className="flex items-center justify-center gap-3 mb-3"><div className="w-10 h-10 bg-teal-400 rounded-2xl flex items-center justify-center text-white font-black text-xl">P</div><div className="text-white text-2xl font-black">PlantCare <span className="text-teal-300">CMMS</span></div></div>
+        <p className="text-slate-400 text-center text-sm mb-8">Preventive Maintenance System</p>
+        <div className="bg-white rounded-2xl shadow-2xl p-6">
+          <div className="inline-flex items-center gap-2 bg-teal-50 border border-teal-200 text-teal-800 rounded-full px-3 py-1.5 text-xs font-bold mb-5">{pl.ic} {pl.name} · {pl.code}</div>
+          <div className="font-bold text-base mb-4">Sign in</div>
+          {err && <div className="bg-red-50 border border-red-200 text-red-700 text-sm rounded-xl px-3 py-2.5 mb-4">{err}</div>}
+          <label className="block text-xs font-bold uppercase tracking-wide text-slate-400 mb-1">Email</label>
+          <input type="email" value={email} onChange={e => setEmail(e.target.value)} onKeyDown={e => e.key === 'Enter' && login()} className="w-full border border-slate-300 rounded-xl px-3 py-2.5 text-sm mb-4 focus:outline-none focus:ring-2 focus:ring-teal-600" placeholder="you@itc.in" autoFocus />
+          <label className="block text-xs font-bold uppercase tracking-wide text-slate-400 mb-1">Password</label>
+          <input type="password" value={pw} onChange={e => setPw(e.target.value)} onKeyDown={e => e.key === 'Enter' && login()} className="w-full border border-slate-300 rounded-xl px-3 py-2.5 text-sm mb-5 focus:outline-none focus:ring-2 focus:ring-teal-600" placeholder="••••••••" />
+          <button onClick={login} disabled={busy} className="w-full bg-teal-700 hover:bg-teal-800 text-white font-bold rounded-xl py-3 text-sm transition-colors disabled:opacity-60">{busy ? 'Signing in…' : `Sign in to ${pl.name}`}</button>
+          <button onClick={() => { setPlantId(null); setErr('') }} className="block w-full text-center text-teal-700 text-xs font-bold mt-4">← Change plant</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+function AuthGate({ children }) {
+  const { profile, loading } = useApp()
+  const [checked, setChecked] = useState(false)
+  const [hasSession, setHasSession] = useState(false)
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => { setHasSession(!!session); setChecked(true) })
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_e, s) => setHasSession(!!s))
+    return () => subscription.unsubscribe()
+  }, [])
+  if (!checked) return <Spinner />
+  if (!hasSession) return <LoginScreen />
+  if (loading || !profile) return <Spinner />
+  return children
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -633,7 +718,11 @@ function Sidebar() {
         <Head>Settings</Head>
         <Item to="/users" icon="👥" label="Users" />
       </nav>
-      <div className="px-4 py-3 border-t border-slate-800"><div className="text-white text-xs font-bold">{profile.name}</div><div className="text-slate-500 text-xs">{profile.role}</div></div>
+    <div className="px-4 py-3 border-t border-slate-800">
+        <div className="text-white text-xs font-bold">{profile.name}</div>
+        <div className="text-slate-500 text-xs mb-2">{profile.role}</div>
+        <button onClick={() => supabase.auth.signOut()} className="w-full border border-slate-700 rounded-xl py-1.5 text-slate-400 text-xs hover:bg-slate-800">Log off</button>
+      </div>
     </aside>
   )
 }
@@ -674,13 +763,46 @@ function Layout() {
     </div>
   )
 }
-
+/* ══════════════════════════════════════════════════════════════════════════
+   PASSWORD GATE  — shared password for the whole plant
+   Change PASSWORD below to whatever you want everyone to type.
+   ══════════════════════════════════════════════════════════════════════════ */
+function Gate({ children }) {
+  const PASSWORD = 'uluberia2026'
+  const [ok, setOk] = useState(() => sessionStorage.getItem('pc_gate') === 'yes')
+  const [pw, setPw] = useState('')
+  const [err, setErr] = useState('')
+  if (ok) return children
+  const submit = () => {
+    if (pw === PASSWORD) { sessionStorage.setItem('pc_gate', 'yes'); setOk(true) }
+    else setErr('Wrong password. Try again.')
+  }
+  return (
+    <div className="min-h-screen flex items-center justify-center p-6 bg-gradient-to-br from-slate-900 to-teal-900">
+      <div className="w-full max-w-sm">
+        <div className="flex items-center justify-center gap-3 mb-3">
+          <div className="w-10 h-10 bg-teal-400 rounded-2xl flex items-center justify-center text-white font-black text-xl">P</div>
+          <div className="text-white text-2xl font-black">PlantCare</div>
+        </div>
+        <p className="text-slate-400 text-center text-sm mb-8">ITC PCPB — Uluberia Plant</p>
+        <div className="bg-white rounded-2xl shadow-2xl p-6">
+          <div className="font-bold text-base mb-4">Enter password</div>
+          {err && <div className="bg-red-50 border border-red-200 text-red-700 text-sm rounded-xl px-3 py-2.5 mb-4">{err}</div>}
+          <input type="password" value={pw} onChange={e => { setPw(e.target.value); setErr('') }} onKeyDown={e => e.key === 'Enter' && submit()} autoFocus placeholder="Password" className="w-full border border-slate-300 rounded-xl px-3 py-2.5 text-sm mb-4 focus:outline-none focus:ring-2 focus:ring-teal-600" />
+          <button onClick={submit} className="w-full bg-teal-700 hover:bg-teal-800 text-white font-bold rounded-xl py-3 text-sm">Enter</button>
+        </div>
+      </div>
+    </div>
+  )
+}
 export default function App() {
   return (
     <AppProvider>
-      <BrowserRouter>
-        <Layout />
-      </BrowserRouter>
+      <AuthGate>
+        <BrowserRouter>
+          <Layout />
+        </BrowserRouter>
+      </AuthGate>
     </AppProvider>
   )
 }
