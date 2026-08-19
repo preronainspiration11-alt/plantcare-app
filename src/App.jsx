@@ -10,7 +10,7 @@ const supabase = createClient(
   'sb_publishable_mEymDkUn9Pgl3KVahDqiiw_qssAnB-F'
 )
 
-// Hardcoded admin (no login for now). Swap for real auth later.
+
 
 const TODAY = () => new Date().toISOString().slice(0, 10)
 
@@ -715,6 +715,120 @@ function CalendarPage() {
   )
 }
 /* ══════════════════════════════════════════════════════════════════════════
+   HISTORY & INSIGHTS
+   ══════════════════════════════════════════════════════════════════════════ */
+function HistoryPage() {
+  const { workOrders, assets } = useApp()
+  const [assetF, setAssetF] = useState('all')
+  const [rangeF, setRangeF] = useState('all')
+  const t = TODAY()
+
+  const cutoff = (() => {
+    if (rangeF === 'all') return null
+    const d = new Date(); d.setDate(d.getDate() - parseInt(rangeF))
+    return d.toISOString().slice(0, 10)
+  })()
+  const inRange = w => {
+    if (!cutoff) return true
+    const ref = w.start_date || (w.created_at ? w.created_at.slice(0, 10) : null)
+    return ref ? ref >= cutoff : true
+  }
+  const matchAsset = w => assetF === 'all' || w.asset_id === assetF
+
+  const scoped = workOrders.filter(w => inRange(w) && matchAsset(w))
+  const closed = scoped.filter(w => w.status === 'Closed')
+  const pending = scoped.filter(w => w.status !== 'Closed')
+  const overdue = pending.filter(w => w.due_date && w.due_date < t)
+  const completion = scoped.length ? Math.round(closed.length / scoped.length * 100) : 0
+
+  const closeDurations = closed
+    .map(w => (w.closed_on && w.start_date) ? (Date.parse(w.closed_on) - Date.parse(w.start_date)) / 86400000 : null)
+    .filter(x => x != null && x >= 0)
+  const avgClose = closeDurations.length ? (closeDurations.reduce((a, b) => a + b, 0) / closeDurations.length) : null
+
+  const rows = assets.map(a => {
+    const list = workOrders.filter(w => w.asset_id === a.id && inRange(w))
+    const cl = list.filter(w => w.status === 'Closed').length
+    const pe = list.filter(w => w.status !== 'Closed').length
+    const od = list.filter(w => w.status !== 'Closed' && w.due_date && w.due_date < t).length
+    return { a, total: list.length, closed: cl, pending: pe, overdue: od }
+  }).filter(r => r.total > 0).sort((a, b) => b.total - a.total)
+  const maxTotal = Math.max(...rows.map(r => r.total), 1)
+
+  const rangeLabel = { all: 'All time', '30': 'Last 30 days', '90': 'Last 90 days', '365': 'Last 12 months' }[rangeF]
+
+  return (
+    <div className="p-6">
+      <div className="flex flex-wrap items-center gap-3 mb-1">
+        <h1 className="text-xl font-black">History &amp; Insights</h1>
+        <div className="flex-1" />
+        <Select value={assetF} onChange={e => setAssetF(e.target.value)} className="w-auto">
+          <option value="all">All assets</option>
+          {buildTree(assets).map(n => <option key={n.a.id} value={n.a.id}>{'\u00A0'.repeat(n.depth * 2)}{n.a.name}</option>)}
+        </Select>
+        <Select value={rangeF} onChange={e => setRangeF(e.target.value)} className="w-auto">
+          <option value="all">All time</option>
+          <option value="30">Last 30 days</option>
+          <option value="90">Last 90 days</option>
+          <option value="365">Last 12 months</option>
+        </Select>
+      </div>
+      <p className="text-sm text-slate-400 mb-5">{rangeLabel}{assetF !== 'all' ? ` · ${assets.find(a => a.id === assetF)?.name || ''}` : ' · all machines'}</p>
+
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-5">
+        <KPICard title="Total work orders" value={scoped.length} />
+        <KPICard title="Closed" value={closed.length} color="text-teal-700" sub={`${completion}% completion`} />
+        <KPICard title="Pending / open" value={pending.length} color="text-blue-700" />
+        <KPICard title="Overdue" value={overdue.length} color={overdue.length ? 'text-red-600' : 'text-slate-400'} />
+      </div>
+
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-6">
+        <KPICard title="Avg time to close" value={avgClose != null ? avgClose.toFixed(1) + ' d' : '—'} />
+        <KPICard title="Preventive closed" value={closed.filter(w => w.type === 'Preventive').length} color="text-teal-700" />
+        <KPICard title="Corrective closed" value={closed.filter(w => w.type === 'Corrective').length} color="text-amber-700" />
+        <KPICard title="Total hours logged" value={scoped.reduce((s, w) => s + spentHrs(w), 0).toFixed(0) + ' h'} color="text-blue-700" />
+      </div>
+
+      <Card className="overflow-x-auto">
+        <CardHead>Per-asset breakdown</CardHead>
+        <table className="w-full text-sm min-w-[640px]">
+          <thead>
+            <tr className="bg-slate-50 text-slate-400 text-xs uppercase tracking-wide">
+              {['Asset', 'Total', 'Closed', 'Pending', 'Overdue', 'Activity'].map(h =>
+                <th key={h} className="text-left px-3 py-2.5 border-b border-slate-200 font-bold">{h}</th>)}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map(r => (
+              <tr key={r.a.id} className="border-t border-slate-100 hover:bg-slate-50 cursor-pointer" onClick={() => setAssetF(r.a.id)}>
+                <td className="px-3 py-2.5"><div className="font-bold">{r.a.name}</div><div className="text-xs text-slate-400">{r.a.code}</div></td>
+                <td className="px-3 py-2.5 font-semibold">{r.total}</td>
+                <td className="px-3 py-2.5 text-teal-700 font-bold">{r.closed}</td>
+                <td className="px-3 py-2.5 text-blue-700 font-bold">{r.pending}</td>
+                <td className={`px-3 py-2.5 font-bold ${r.overdue ? 'text-red-600' : 'text-slate-300'}`}>{r.overdue || '—'}</td>
+                <td className="px-3 py-2.5">
+                  <div className="h-2 bg-slate-100 rounded-full overflow-hidden w-32">
+                    <div className="h-full flex">
+                      <div className="h-full bg-teal-500" style={{ width: `${r.total ? r.closed / maxTotal * 100 : 0}%` }} />
+                      <div className="h-full bg-blue-400" style={{ width: `${r.total ? r.pending / maxTotal * 100 : 0}%` }} />
+                    </div>
+                  </div>
+                </td>
+              </tr>
+            ))}
+            {rows.length === 0 && <tr><td colSpan={6} className="px-3 py-8 text-center text-slate-400">No work orders in this period.</td></tr>}
+          </tbody>
+        </table>
+      </Card>
+      <div className="flex gap-4 mt-3 text-xs text-slate-400">
+        <span><span className="inline-block w-3 h-3 rounded bg-teal-500 mr-1.5 align-middle" />Closed</span>
+        <span><span className="inline-block w-3 h-3 rounded bg-blue-400 mr-1.5 align-middle" />Pending</span>
+        <span className="ml-auto">Tip: click a row to filter everything above to that asset.</span>
+      </div>
+    </div>
+  )
+}
+/* ══════════════════════════════════════════════════════════════════════════
    SHELL
    ══════════════════════════════════════════════════════════════════════════ */
 function Sidebar() {
@@ -750,6 +864,7 @@ function Sidebar() {
         <Item to="/active-insights" icon="📊" label="Active WOs" />
         <Item to="/closed-insights" icon="📈" label="Closed WOs" />
         <Item to="/asset-insights" icon="🔍" label="Assets" />
+        <Item to="/history" icon="📜" label="History" />
         <Head>Settings</Head>
         <Item to="/users" icon="👥" label="Users" />
       </nav>
@@ -790,6 +905,7 @@ function Layout() {
             <Route path="/active-insights" element={<ActiveInsightsPage />} />
             <Route path="/closed-insights" element={<ClosedInsightsPage />} />
             <Route path="/asset-insights" element={<AssetInsightsPage />} />
+            <Route path="/history" element={<HistoryPage />} />
             <Route path="/users" element={<UsersPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
