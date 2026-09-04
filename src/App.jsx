@@ -24,14 +24,24 @@ const spentHrs = wo => (wo.wo_tasks || []).reduce((s, t) => s + (parseFloat(t.hr
 const PRIORITY_COLOR = { High: '#DC2626', Medium: '#D97706', Low: '#16A34A' }
 const KIND_IC = { location: '🏭', line: '🔗', equipment: '🔩', tool: '🧰' }
 
+// PM vs Breakdown terminology. Preventive => "PM Ticket"; Corrective => "Breakdown Work Order".
+const isPM = wo => wo.type === 'Preventive'
+const ticketKind = wo => isPM(wo) ? 'PM Ticket' : 'Breakdown Work Order'
+const ticketKindShort = wo => isPM(wo) ? 'PM Ticket' : 'Breakdown'
+// actual worked duration in hours from started_at/completed_at timestamps
+const durationHrs = wo => {
+  if (!wo.started_at || !wo.completed_at) return null
+  const h = (Date.parse(wo.completed_at) - Date.parse(wo.started_at)) / 3600000
+  return (isNaN(h) || h < 0) ? null : h
+}
+// new close rule: every task ticked AND both start & completion times filled
 function closeBlockers(wo) {
   const tasks = wo.wo_tasks || []
-  if (!tasks.length) return { blocked: false, msgs: [] }
   const msgs = []
   const un = tasks.filter(t => !t.done).length
-  const nh = tasks.filter(t => t.done && (t.hrs_spent == null || isNaN(parseFloat(t.hrs_spent)))).length
   if (un) msgs.push(`${un} task(s) not ticked`)
-  if (nh) msgs.push(`${nh} ticked task(s) missing hours`)
+  if (!wo.started_at) msgs.push('Start Time not set')
+  if (!wo.completed_at) msgs.push('Completion Time not set')
   return { blocked: msgs.length > 0, msgs }
 }
 function assetPath(id, assets) {
@@ -230,9 +240,11 @@ function AuthGate({ children }) {
    UI PRIMITIVES
    ══════════════════════════════════════════════════════════════════════════ */
 const Badge = ({ variant = 'status', children }) => {
-  const c = { High: 'bg-red-100 text-red-800', Medium: 'bg-amber-100 text-amber-800', Low: 'bg-green-100 text-green-800', status: 'bg-slate-100 text-slate-600', type: 'bg-indigo-50 text-indigo-700', pending: 'bg-amber-100 text-amber-800', ok: 'bg-green-100 text-green-800', rej: 'bg-red-100 text-red-800' }[variant] || 'bg-slate-100 text-slate-600'
+  const c = { High: 'bg-red-100 text-red-800', Medium: 'bg-amber-100 text-amber-800', Low: 'bg-green-100 text-green-800', status: 'bg-slate-100 text-slate-600', type: 'bg-indigo-50 text-indigo-700', pm: 'bg-teal-100 text-teal-800', bd: 'bg-rose-100 text-rose-800', pending: 'bg-amber-100 text-amber-800', ok: 'bg-green-100 text-green-800', rej: 'bg-red-100 text-red-800' }[variant] || 'bg-slate-100 text-slate-600'
   return <span className={`inline-block px-2.5 py-0.5 rounded-full text-xs font-bold whitespace-nowrap ${c}`}>{children}</span>
 }
+// convenience: kind badge for a work order
+const KindBadge = ({ wo }) => <Badge variant={isPM(wo) ? 'pm' : 'bd'}>{ticketKindShort(wo)}</Badge>
 const Btn = ({ variant = 'line', children, className = '', ...p }) => {
   const c = { teal: 'bg-teal-700 text-white hover:bg-teal-800', line: 'border border-slate-300 text-slate-700 bg-white hover:bg-slate-50', ghost: 'border border-teal-700 text-teal-700 bg-white hover:bg-teal-50', red: 'border border-red-300 text-red-600 bg-white hover:bg-red-50', dark: 'bg-slate-800 text-white hover:bg-slate-700' }[variant] || ''
   return <button {...p} className={`rounded-xl px-3.5 py-2 text-sm font-bold cursor-pointer transition-colors ${c} ${className}`}>{children}</button>
@@ -270,7 +282,8 @@ function Modal({ title, eyebrow, onClose, footer, children, maxWidth = 'max-w-3x
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
-   WORK ORDER MODAL
+   WORK ORDER MODAL  (PM Ticket / Breakdown)
+   New: Work Permit No, Start/Completion timestamps, Remarks. No per-task hours.
    ══════════════════════════════════════════════════════════════════════════ */
 function WOModal({ wo, onClose }) {
   const { profile, perms, users, assets, projects, rWOs } = useApp()
@@ -282,44 +295,64 @@ function WOModal({ wo, onClose }) {
   const a = assets.find(x => x.id === wo.asset_id) || { name: '?', status: 'Online' }
   const closed = wo.status === 'Closed'
   const canExec = perms.edit || wo.assigned_to === profile?.id
-  const dn = doneCt(wo), sp = spentHrs(wo), blk = closeBlockers(wo)
+  const dn = doneCt(wo), blk = closeBlockers(wo)
+  const dur = durationHrs(wo)
   const lockTask = !canExec || closed, lockEdit = !perms.edit || closed
 
   const tog = async (t, v) => { await updTask(t.id, { done: v }); await rWOs(); setCErr('') }
-  const hrs = async (t, v) => { await updTask(t.id, { hrs_spent: v === '' ? null : parseFloat(v) }); await rWOs() }
   const res = async (t, v) => { await updTask(t.id, { result: v || null }); await rWOs() }
-  const fld = async (f, v) => { await updWO(wo.id, { [f]: v === '' ? null : v }); await rWOs() }
+  const fld = async (f, v) => { await updWO(wo.id, { [f]: v === '' ? null : v }); await rWOs(); setCErr('') }
   const start = async () => { setSaving(true); await updWO(wo.id, { status: 'In Progress' }); await rWOs(); setSaving(false) }
-  const close = async () => { if (blk.blocked) { setCErr('Cannot close: ' + blk.msgs.join(', ') + '.'); return } setSaving(true); await updWO(wo.id, { status: 'Closed', closed_on: TODAY() }); await addLog(wo.id, profile.name, `Closed — ${wo.wo_tasks.length} tasks, ${sp.toFixed(1)} h spent vs ${wo.est_hrs} h est.`); await rWOs(); setSaving(false); onClose() }
+  const close = async () => {
+    if (blk.blocked) { setCErr('Cannot close: ' + blk.msgs.join(', ') + '.'); return }
+    setSaving(true)
+    await updWO(wo.id, { status: 'Closed', closed_on: TODAY() })
+    const d = durationHrs(wo)
+    await addLog(wo.id, profile.name, `Closed — ${wo.wo_tasks.length} tasks done${d != null ? `, ${d.toFixed(1)} h actual duration` : ''}.`)
+    await rWOs(); setSaving(false); onClose()
+  }
   const addN = async () => { if (!note.trim()) return; setSaving(true); await addLog(wo.id, profile.name, note.trim()); await rWOs(); setNote(''); setSaving(false) }
   const addP = async () => { const n = prompt('Part name'); if (!n) return; await addPartRow(wo.id, n, 1); await rWOs() }
 
   const tabs = [['checklist', `Checklist (${dn}/${wo.wo_tasks?.length ?? 0})`], ['general', 'General'], ['parts', `Parts (${wo.wo_parts?.length ?? 0})`], ['log', `Log (${wo.wo_log?.length ?? 0})`]]
   let body
   if (tab === 'checklist') body = <>
-    {closed && <Note>Closed {fmtDate(wo.closed_on)} — {sp.toFixed(1)} h spent vs {wo.est_hrs} h est.</Note>}
-    {!closed && canExec && <Note>Close only when every task is ticked <strong>and</strong> hours entered.</Note>}
-    <div className="grid grid-cols-[1fr_60px_78px_120px] gap-2 px-2 pb-2 text-xs font-bold uppercase text-slate-400"><span>Task</span><span>Est</span><span>Spent</span><span>Result</span></div>
-    {(wo.wo_tasks || []).map(t => { const miss = t.done && (t.hrs_spent == null || isNaN(parseFloat(t.hrs_spent))); return (
-      <div key={t.id} className={`grid grid-cols-[1fr_60px_78px_120px] gap-2 border rounded-xl p-2.5 mb-2 items-center ${t.done && !miss ? 'bg-teal-50 border-teal-200' : miss ? 'bg-red-50 border-red-200' : 'border-slate-200'}`}>
+    {closed && <Note>Closed {fmtDate(wo.closed_on)}{dur != null ? ` — ${dur.toFixed(1)} h actual duration` : ''}.</Note>}
+    {!closed && canExec && <Note variant="amber">To close this {isPM(wo) ? 'PM ticket' : 'breakdown work order'}: tick every task <strong>and</strong> fill both Start Time and Completion Time (in the General tab).</Note>}
+
+    {/* Work permit + start/completion live at the top of the checklist for quick entry */}
+    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-4">
+      <Field label="Work Permit No."><Input defaultValue={wo.permit_no ?? ''} disabled={lockEdit} onBlur={e => fld('permit_no', e.target.value)} placeholder="e.g. WP-2026-0500" /></Field>
+      <Field label={isPM(wo) ? 'PM Start Time' : 'Job Start Time'}><Input type="datetime-local" defaultValue={wo.started_at ?? ''} disabled={lockEdit} onChange={e => fld('started_at', e.target.value)} /></Field>
+      <Field label="Completion Time"><Input type="datetime-local" defaultValue={wo.completed_at ?? ''} disabled={lockEdit} onChange={e => fld('completed_at', e.target.value)} /></Field>
+    </div>
+
+    <Lbl>Checklist</Lbl>
+    <div className="grid grid-cols-[1fr_150px] gap-2 px-2 pb-2 text-xs font-bold uppercase text-slate-400"><span>Task</span><span>Result</span></div>
+    {(wo.wo_tasks || []).map(t => (
+      <div key={t.id} className={`grid grid-cols-[1fr_150px] gap-2 border rounded-xl p-2.5 mb-2 items-center ${t.done ? 'bg-teal-50 border-teal-200' : 'border-slate-200'}`}>
         <label className="flex items-start gap-2 cursor-pointer"><input type="checkbox" checked={t.done} disabled={lockTask} onChange={e => tog(t, e.target.checked)} className="mt-0.5 w-4 h-4 accent-teal-600" /><span className={`text-sm ${t.done ? 'line-through text-slate-400' : ''}`}>{t.description}</span></label>
-        <div className="text-center text-xs text-slate-400 bg-slate-50 border border-slate-200 rounded-lg py-1">{t.est_hrs ?? '—'}</div>
-        <input type="text" placeholder="0.0" defaultValue={t.hrs_spent ?? ''} disabled={lockTask} onBlur={e => hrs(t, e.target.value)} className="border border-slate-300 rounded-lg px-2 py-1 text-sm w-full disabled:bg-slate-50" />
         <select defaultValue={t.result || ''} disabled={lockTask} onChange={e => res(t, e.target.value)} className="border border-slate-300 rounded-lg px-1 py-1 text-sm w-full disabled:bg-slate-50"><option value="">Result…</option>{['OK', 'Adjusted', 'Replaced', 'Needs attention'].map(r => <option key={r}>{r}</option>)}</select>
-      </div>) })}
+      </div>))}
     <ProgressBar done={dn} total={wo.wo_tasks?.length ?? 0} />
-    <div className="text-xs text-slate-400 mt-1.5">{dn}/{wo.wo_tasks?.length ?? 0} tasks · {sp.toFixed(1)} h of {wo.est_hrs} h est</div>
+    <div className="text-xs text-slate-400 mt-1.5">{dn}/{wo.wo_tasks?.length ?? 0} tasks{dur != null ? ` · ${dur.toFixed(1)} h actual duration` : (wo.started_at && !wo.completed_at ? ' · started, awaiting completion time' : '')}</div>
+
+    {/* Remarks */}
+    <div className="mt-4"><Lbl>Remarks</Lbl><Textarea rows={3} defaultValue={wo.remarks ?? ''} disabled={lockEdit} onBlur={e => fld('remarks', e.target.value)} placeholder="Observations, parts used, follow-ups…" /></div>
   </>
   else if (tab === 'general') body = <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
     <Field label="Priority"><Select defaultValue={wo.priority} disabled={lockEdit} onChange={e => fld('priority', e.target.value)}>{['High', 'Medium', 'Low'].map(x => <option key={x}>{x}</option>)}</Select></Field>
-    <Field label="Type"><Select defaultValue={wo.type} disabled={lockEdit} onChange={e => fld('type', e.target.value)}>{['Preventive', 'Corrective'].map(x => <option key={x}>{x}</option>)}</Select></Field>
+    <Field label="Type"><Select defaultValue={wo.type} disabled={lockEdit} onChange={e => fld('type', e.target.value)}><option value="Preventive">Preventive (PM Ticket)</option><option value="Corrective">Corrective (Breakdown)</option></Select></Field>
     <Field label="Assigned to"><Select defaultValue={wo.assigned_to ?? ''} disabled={lockEdit} onChange={e => fld('assigned_to', e.target.value)}><option value="">— None —</option>{users.map(u => <option key={u.id} value={u.id}>{u.name}</option>)}</Select></Field>
     <Field label="Project"><Select defaultValue={wo.project_id ?? ''} disabled={lockEdit} onChange={e => fld('project_id', e.target.value)}><option value="">— None —</option>{projects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</Select></Field>
-    <Field label="Estimated hours"><Input type="text" defaultValue={wo.est_hrs} disabled={lockEdit} onBlur={e => fld('est_hrs', parseFloat(e.target.value) || 0)} /></Field>
-    <Field label="Hours spent"><Input value={sp.toFixed(1) + ' h'} disabled /></Field>
-    <Field label="Start date"><Input type="date" defaultValue={wo.start_date} disabled={lockEdit} onBlur={e => fld('start_date', e.target.value)} /></Field>
+    <Field label="Work Permit No."><Input defaultValue={wo.permit_no ?? ''} disabled={lockEdit} onBlur={e => fld('permit_no', e.target.value)} placeholder="e.g. WP-2026-0500" /></Field>
+    <Field label="Actual duration"><Input value={dur != null ? dur.toFixed(1) + ' h' : '—'} disabled /></Field>
+    <Field label={isPM(wo) ? 'PM Start Time' : 'Job Start Time'}><Input type="datetime-local" defaultValue={wo.started_at ?? ''} disabled={lockEdit} onChange={e => fld('started_at', e.target.value)} /></Field>
+    <Field label="Completion Time"><Input type="datetime-local" defaultValue={wo.completed_at ?? ''} disabled={lockEdit} onChange={e => fld('completed_at', e.target.value)} /></Field>
+    <Field label="Start date (planned)"><Input type="date" defaultValue={wo.start_date} disabled={lockEdit} onBlur={e => fld('start_date', e.target.value)} /></Field>
     <Field label="Due date"><Input type="date" defaultValue={wo.due_date} disabled={lockEdit} onBlur={e => fld('due_date', e.target.value)} /></Field>
     <Field label="Asset" full><Input value={assetPath(wo.asset_id, assets)} disabled /></Field>
+    <Field label="Remarks" full><Textarea rows={3} defaultValue={wo.remarks ?? ''} disabled={lockEdit} onBlur={e => fld('remarks', e.target.value)} placeholder="Observations, parts used, follow-ups…" /></Field>
   </div>
   else if (tab === 'parts') body = <>
     {(wo.wo_parts || []).length === 0 && <p className="text-sm text-slate-400">No parts reserved.</p>}
@@ -333,9 +366,9 @@ function WOModal({ wo, onClose }) {
   </>
 
   return (
-    <Modal eyebrow={`Work order · ${a.name}`} title={`#${wo.id} · ${wo.title}`} onClose={onClose}
-      footer={<>{!closed && canExec && wo.status === 'Open' && <Btn variant="line" onClick={start} disabled={saving}>Start work</Btn>}{!closed && canExec && <Btn variant="teal" onClick={close} disabled={saving} className={blk.blocked ? 'opacity-60' : ''}>{blk.blocked ? 'Close 🔒' : 'Close work order'}</Btn>}{closed && <span className="text-sm text-slate-400">Closed {fmtDate(wo.closed_on)}</span>}</>}>
-      <div className="flex gap-2 mb-3 flex-wrap items-center"><Badge variant={wo.priority}>{wo.priority}</Badge><Badge variant="status">{wo.status}</Badge><Badge variant="type">{wo.type}</Badge><span className="text-xs text-slate-400">{fmtDate(wo.start_date)} → {fmtDate(wo.due_date)}</span><span className="text-xs font-bold text-blue-700">Est {wo.est_hrs} h · Spent {sp.toFixed(1)} h</span></div>
+    <Modal eyebrow={`${ticketKind(wo)} · ${a.name}`} title={`#${wo.id} · ${wo.title}`} onClose={onClose}
+      footer={<>{!closed && canExec && wo.status === 'Open' && <Btn variant="line" onClick={start} disabled={saving}>Start work</Btn>}{!closed && canExec && <Btn variant="teal" onClick={close} disabled={saving} className={blk.blocked ? 'opacity-60' : ''}>{blk.blocked ? 'Close 🔒' : `Close ${isPM(wo) ? 'PM ticket' : 'work order'}`}</Btn>}{closed && <span className="text-sm text-slate-400">Closed {fmtDate(wo.closed_on)}</span>}</>}>
+      <div className="flex gap-2 mb-3 flex-wrap items-center"><KindBadge wo={wo} /><Badge variant={wo.priority}>{wo.priority}</Badge><Badge variant="status">{wo.status}</Badge><span className="text-xs text-slate-400">{wo.started_at ? `${fmtDateTime(wo.started_at)}` : `planned ${fmtDate(wo.start_date)}`} {wo.completed_at ? `→ ${fmtDateTime(wo.completed_at)}` : ''}</span>{dur != null && <span className="text-xs font-bold text-blue-700">Duration {dur.toFixed(1)} h</span>}</div>
       <div className="flex gap-1 border-b border-slate-200 mb-5 overflow-x-auto">{tabs.map(([k, l]) => <button key={k} onClick={() => setTab(k)} className={`px-3 py-2.5 text-sm font-bold whitespace-nowrap border-b-2 ${tab === k ? 'text-teal-700 border-teal-600' : 'text-slate-400 border-transparent hover:text-slate-600'}`}>{l}</button>)}</div>
       {cErr && <Note variant="red">{cErr}</Note>}
       {body}
@@ -348,22 +381,23 @@ function WOModal({ wo, onClose }) {
    ══════════════════════════════════════════════════════════════════════════ */
 function CreateWOModal({ onClose, prefill = null, onCreated = null }) {
   const { profile, users, assets, taskGroups, rWOs } = useApp()
-  const [f, setF] = useState({ title: prefill?.title || '', asset_id: prefill?.asset_id || (assets[0]?.id ?? ''), assigned_to: users[0]?.id ?? '', priority: prefill?.priority || 'Medium', type: prefill?.fromReq ? 'Corrective' : 'Preventive', start_date: TODAY(), due_date: TODAY(), est_hrs: '1', tg_id: '', tasks: '' })
+  const [f, setF] = useState({ title: prefill?.title || '', asset_id: prefill?.asset_id || (assets[0]?.id ?? ''), assigned_to: users[0]?.id ?? '', priority: prefill?.priority || 'Medium', type: prefill?.type || (prefill?.fromReq ? 'Corrective' : 'Preventive'), start_date: TODAY(), due_date: TODAY(), permit_no: '', tg_id: '', tasks: '' })
   const [saving, setSaving] = useState(false)
   const set = (k, v) => setF(o => ({ ...o, [k]: v }))
   const tree = buildTree(assets)
-  const applyTG = id => { const g = taskGroups.find(x => x.id === id); set('tg_id', id); if (!g) return; set('tasks', (g.task_group_items || []).map(t => t.description).join('\n')); const tot = (g.task_group_items || []).reduce((s, t) => s + (parseFloat(t.est_hrs) || 0), 0); if (tot > 0) set('est_hrs', String(Math.round(tot * 100) / 100)); if (!f.title) set('title', g.name) }
+  const applyTG = id => { const g = taskGroups.find(x => x.id === id); set('tg_id', id); if (!g) return; set('tasks', (g.task_group_items || []).map(t => t.description).join('\n')); if (!f.title) set('title', g.name) }
+  const isPMForm = f.type === 'Preventive'
   const save = async () => {
     if (!f.title.trim()) { alert('Enter a title.'); return }
     setSaving(true)
     const g = taskGroups.find(x => x.id === f.tg_id)
     const tasks = f.tasks.split('\n').map(s => s.trim()).filter(Boolean).map((desc, i) => { const it = g?.task_group_items?.find(t => t.description === desc); return { description: desc, position: i, est_hrs: it?.est_hrs ?? null } })
-    const id = await createWO({ plant_id: profile.plant_id, title: f.title.trim(), asset_id: f.asset_id || null, assigned_to: f.assigned_to || null, priority: f.priority, type: f.type, start_date: f.start_date, due_date: f.due_date, est_hrs: parseFloat(f.est_hrs) || 0, created_by: profile.id, tasks, log: [{ author_name: profile.name, body: `Created${g ? ' from task group: ' + g.name : ''}${prefill?.fromReq ? ' from work request' : ''}.` }] })
+    const id = await createWO({ plant_id: profile.plant_id, title: f.title.trim(), asset_id: f.asset_id || null, assigned_to: f.assigned_to || null, priority: f.priority, type: f.type, start_date: f.start_date, due_date: f.due_date, permit_no: f.permit_no || null, created_by: profile.id, tasks, log: [{ author_name: profile.name, body: `Created${g ? ' from task group: ' + g.name : ''}${prefill?.fromReq ? ' from work request' : ''}.` }] })
     if (onCreated) await onCreated(id)
     await rWOs(); setSaving(false); onClose()
   }
   return (
-    <Modal title="New work order" onClose={onClose} maxWidth="max-w-2xl" footer={<><Btn variant="line" onClick={onClose}>Cancel</Btn><Btn variant="teal" onClick={save} disabled={saving}>Create work order</Btn></>}>
+    <Modal title={isPMForm ? 'New PM ticket' : 'New breakdown work order'} onClose={onClose} maxWidth="max-w-2xl" footer={<><Btn variant="line" onClick={onClose}>Cancel</Btn><Btn variant="teal" onClick={save} disabled={saving}>{isPMForm ? 'Create PM ticket' : 'Create work order'}</Btn></>}>
       {prefill?.desc && <Note>Request: {prefill.desc}</Note>}
       <div className="mb-3"><Lbl>Task group (optional — fills checklist)</Lbl><Select value={f.tg_id} onChange={e => applyTG(e.target.value)}><option value="">— None, type manually —</option>{taskGroups.map(g => <option key={g.id} value={g.id}>{g.name} ({g.task_group_items?.length ?? 0} tasks)</option>)}</Select></div>
       <div className="mb-3"><Lbl>Title</Lbl><Input value={f.title} onChange={e => set('title', e.target.value)} placeholder="e.g. Monthly PM — Case Packer" /></div>
@@ -371,10 +405,10 @@ function CreateWOModal({ onClose, prefill = null, onCreated = null }) {
         <Field label="Asset"><Select value={f.asset_id} onChange={e => set('asset_id', e.target.value)}>{tree.map(n => <option key={n.a.id} value={n.a.id}>{'\u00A0'.repeat(n.depth * 2)}{n.a.name} ({n.a.code})</option>)}</Select></Field>
         <Field label="Assign to"><Select value={f.assigned_to} onChange={e => set('assigned_to', e.target.value)}><option value="">— None —</option>{users.map(u => <option key={u.id} value={u.id}>{u.name}</option>)}</Select></Field>
         <Field label="Priority"><Select value={f.priority} onChange={e => set('priority', e.target.value)}>{['High', 'Medium', 'Low'].map(x => <option key={x}>{x}</option>)}</Select></Field>
-        <Field label="Type"><Select value={f.type} onChange={e => set('type', e.target.value)}><option>Preventive</option><option>Corrective</option></Select></Field>
-        <Field label="Start date"><Input type="date" value={f.start_date} onChange={e => set('start_date', e.target.value)} /></Field>
+        <Field label="Type"><Select value={f.type} onChange={e => set('type', e.target.value)}><option value="Preventive">Preventive (PM Ticket)</option><option value="Corrective">Corrective (Breakdown)</option></Select></Field>
+        <Field label="Planned start date"><Input type="date" value={f.start_date} onChange={e => set('start_date', e.target.value)} /></Field>
         <Field label="Due date"><Input type="date" value={f.due_date} onChange={e => set('due_date', e.target.value)} /></Field>
-        <Field label="Estimated hours"><Input value={f.est_hrs} onChange={e => set('est_hrs', e.target.value)} /></Field>
+        <Field label="Work Permit No. (optional)"><Input value={f.permit_no} onChange={e => set('permit_no', e.target.value)} placeholder="WP-2026-0500" /></Field>
       </div>
       <div><Lbl>Checklist tasks — one per line</Lbl><Textarea rows={5} value={f.tasks} onChange={e => set('tasks', e.target.value)} placeholder={"Check belt tension\nLubricate bearings\nInspect seals"} /></div>
     </Modal>
@@ -393,22 +427,21 @@ function DashboardPage() {
   const overdue = open.filter(w => w.due_date && w.due_date < t)
   const onTime = closed.filter(w => w.closed_on && w.closed_on <= w.due_date)
   const comp = closed.length ? onTime.length / closed.length : 0
-  const backlog = open.reduce((s, w) => s + (w.est_hrs || 0), 0)
   const techs = users.filter(u => u.role === 'technician')
   const week = [...open].sort((a, b) => (a.due_date || '') < (b.due_date || '') ? -1 : 1).slice(0, 8)
   return (
     <div className="p-6">
       <h1 className="text-xl font-black mb-5">Dashboard</h1>
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-5">
-        <Card className="flex items-center gap-4 p-4 col-span-2"><div className="text-center"><GaugeSVG pct={comp} /><div className="text-xs text-slate-400">closed on time</div></div><div><div className="text-xs font-bold uppercase text-slate-400 mb-1">Schedule Compliance</div><div className="text-xs text-slate-400">{onTime.length} of {closed.length} closed WOs on time</div></div></Card>
-        <Card className="flex items-center gap-4 p-4 col-span-2"><RingSVG n={overdue.length} total={workOrders.length} color="#B91C1C" /><div><div className="text-xs font-bold uppercase text-slate-400 mb-1">Overdue</div><div className="text-xs text-slate-400">{overdue.length} of {workOrders.length} total WOs</div></div></Card>
-        <KPICard title="Open work orders" value={open.length} color="text-teal-700" />
+        <Card className="flex items-center gap-4 p-4 col-span-2"><div className="text-center"><GaugeSVG pct={comp} /><div className="text-xs text-slate-400">closed on time</div></div><div><div className="text-xs font-bold uppercase text-slate-400 mb-1">Schedule Compliance</div><div className="text-xs text-slate-400">{onTime.length} of {closed.length} closed on time</div></div></Card>
+        <Card className="flex items-center gap-4 p-4 col-span-2"><RingSVG n={overdue.length} total={workOrders.length} color="#B91C1C" /><div><div className="text-xs font-bold uppercase text-slate-400 mb-1">Overdue</div><div className="text-xs text-slate-400">{overdue.length} of {workOrders.length} total</div></div></Card>
+        <KPICard title="Open tickets" value={open.length} color="text-teal-700" />
         <KPICard title="Closed" value={closed.length} color="text-slate-500" />
-        <KPICard title="Backlog (est)" value={backlog.toFixed(1) + ' h'} />
-        <KPICard title="Assets" value={assets.length} color="text-blue-700" />
+        <KPICard title="PM tickets" value={workOrders.filter(isPM).length} color="text-teal-700" />
+        <KPICard title="Breakdowns" value={workOrders.filter(w => !isPM(w)).length} color="text-rose-700" />
       </div>
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <Card><CardHead>Open work orders</CardHead>{week.length === 0 ? <p className="px-4 py-6 text-sm text-slate-400">Nothing open. Create a work order to begin.</p> : week.map(w => { const a = assets.find(x => x.id === w.asset_id) || { name: '?' }; const od = w.due_date && w.due_date < t; return <button key={w.id} onClick={() => setOpenWO(w)} className="flex items-center gap-3 px-4 py-3 w-full text-left border-t border-slate-100 hover:bg-slate-50"><span className="w-1.5 h-8 rounded-full flex-shrink-0" style={{ background: PRIORITY_COLOR[w.priority] }} /><div className="flex-1 min-w-0"><div className="font-bold text-sm truncate">#{w.id} · {w.title}</div><div className="text-xs text-slate-400">{a.name} · due <span className={od ? 'text-red-600 font-bold' : ''}>{fmtDate(w.due_date)}</span></div></div><span className="text-xs text-slate-400">{doneCt(w)}/{w.wo_tasks?.length ?? 0}</span><Badge variant={w.priority}>{w.priority}</Badge></button> })}</Card>
+        <Card><CardHead>Open work</CardHead>{week.length === 0 ? <p className="px-4 py-6 text-sm text-slate-400">Nothing open. Create a ticket to begin.</p> : week.map(w => { const a = assets.find(x => x.id === w.asset_id) || { name: '?' }; const od = w.due_date && w.due_date < t; return <button key={w.id} onClick={() => setOpenWO(w)} className="flex items-center gap-3 px-4 py-3 w-full text-left border-t border-slate-100 hover:bg-slate-50"><span className="w-1.5 h-8 rounded-full flex-shrink-0" style={{ background: PRIORITY_COLOR[w.priority] }} /><div className="flex-1 min-w-0"><div className="font-bold text-sm truncate">#{w.id} · {w.title}</div><div className="text-xs text-slate-400">{a.name} · due <span className={od ? 'text-red-600 font-bold' : ''}>{fmtDate(w.due_date)}</span></div></div><span className="text-xs text-slate-400">{doneCt(w)}/{w.wo_tasks?.length ?? 0}</span><KindBadge wo={w} /></button> })}</Card>
         <Card><CardHead>Workload by technician</CardHead>{techs.length === 0 ? <p className="px-4 py-4 text-sm text-slate-400">No technicians yet. Add users in Settings.</p> : techs.map(u => { const o = open.filter(w => w.assigned_to === u.id), od = o.filter(w => w.due_date && w.due_date < t); return <div key={u.id} className="flex items-center gap-3 px-4 py-2.5 border-t border-slate-100 text-sm"><div className="w-8 h-8 rounded-full text-white text-xs font-bold flex items-center justify-center flex-shrink-0" style={{ background: u.color || '#0F766E' }}>{u.initials || '?'}</div><span className="flex-1 truncate">{u.name}</span><span className="text-teal-700 font-bold">{o.length} open</span>{od.length ? <span className="text-red-600 font-bold">{od.length} overdue</span> : <span className="text-slate-400">on track</span>}</div> })}</Card>
       </div>
       {openWO && <WOModal wo={workOrders.find(w => w.id === openWO.id) || openWO} onClose={() => setOpenWO(null)} />}
@@ -420,21 +453,41 @@ function WorkOrdersPage({ mine = false }) {
   const { profile, perms, workOrders, assets, users } = useApp()
   const [search, setSearch] = useState('')
   const [statusF, setStatusF] = useState('All')
+  const [kindF, setKindF] = useState('all') // all | PM | BD
   const [openWO, setOpenWO] = useState(null)
   const [creating, setCreating] = useState(false)
+  const [createType, setCreateType] = useState('Preventive')
   const t = TODAY()
   const base = mine ? workOrders.filter(w => w.assigned_to === profile?.id) : workOrders
-  const list = base.filter(w => statusF === 'All' || w.status === statusF).filter(w => { const a = assets.find(x => x.id === w.asset_id) || { name: '', code: '' }; return (w.title + w.id + a.name + a.code).toLowerCase().includes(search.toLowerCase()) }).sort((a, b) => (a.due_date || '') < (b.due_date || '') ? -1 : 1)
+  const list = base
+    .filter(w => kindF === 'all' || (kindF === 'PM' ? isPM(w) : !isPM(w)))
+    .filter(w => statusF === 'All' || w.status === statusF)
+    .filter(w => { const a = assets.find(x => x.id === w.asset_id) || { name: '', code: '' }; return (w.title + w.id + a.name + a.code).toLowerCase().includes(search.toLowerCase()) })
+    .sort((a, b) => (a.due_date || '') < (b.due_date || '') ? -1 : 1)
+  const nPM = base.filter(isPM).length, nBD = base.filter(w => !isPM(w)).length
+  const startCreate = type => { setCreateType(type); setCreating(true) }
   return (
     <div className="p-6">
-      <div className="flex flex-wrap items-center gap-3 mb-4"><h1 className="text-xl font-black">{mine ? 'Assigned to me' : 'Work Orders'}</h1><div className="flex-1" /><input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search…" className="border border-slate-300 rounded-xl px-3 py-2 text-sm w-48 focus:outline-none focus:ring-2 focus:ring-teal-600" /><Select value={statusF} onChange={e => setStatusF(e.target.value)} className="w-auto">{['All', 'Open', 'In Progress', 'Closed'].map(s => <option key={s}>{s}</option>)}</Select>{perms.create && !mine && <Btn variant="teal" onClick={() => setCreating(true)}>+ New work order</Btn>}</div>
+      <div className="flex flex-wrap items-center gap-3 mb-3">
+        <h1 className="text-xl font-black">{mine ? 'Assigned to me' : 'Work Orders'}</h1>
+        <div className="flex-1" />
+        <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search…" className="border border-slate-300 rounded-xl px-3 py-2 text-sm w-44 focus:outline-none focus:ring-2 focus:ring-teal-600" />
+        <Select value={statusF} onChange={e => setStatusF(e.target.value)} className="w-auto">{['All', 'Open', 'In Progress', 'Closed'].map(s => <option key={s}>{s}</option>)}</Select>
+        {perms.create && !mine && <Btn variant="ghost" onClick={() => startCreate('Preventive')}>+ PM ticket</Btn>}
+        {perms.create && !mine && <Btn variant="teal" onClick={() => startCreate('Corrective')}>+ Breakdown</Btn>}
+      </div>
+      {/* PM / Breakdown / All toggle */}
+      <div className="inline-flex bg-slate-100 rounded-xl p-1 mb-4">
+        {[['all', `All (${base.length})`], ['PM', `PM Tickets (${nPM})`], ['BD', `Breakdown (${nBD})`]].map(([k, l]) =>
+          <button key={k} onClick={() => setKindF(k)} className={`px-4 py-1.5 rounded-lg text-sm font-bold ${kindF === k ? 'bg-white shadow text-slate-900' : 'text-slate-500'}`}>{l}</button>)}
+      </div>
       <Card className="overflow-x-auto">
-        <table className="w-full text-sm min-w-[760px]"><thead><tr className="bg-slate-50 text-slate-400 text-xs uppercase">{['WO', 'Asset', 'Priority', 'Status', 'Assigned', 'Due', 'Est', 'Spent', 'Tasks'].map(h => <th key={h} className="text-left px-3 py-2.5 border-b border-slate-200 font-bold">{h}</th>)}</tr></thead>
-        <tbody>{list.map(w => { const a = assets.find(x => x.id === w.asset_id) || { name: '?', code: '?' }; const u = users.find(x => x.id === w.assigned_to); const od = w.due_date && w.due_date < t && w.status !== 'Closed'; const sp = spentHrs(w); return <tr key={w.id} onClick={() => setOpenWO(w)} className="border-t border-slate-100 hover:bg-slate-50 cursor-pointer"><td className="px-3 py-2.5"><div className="font-bold">#{w.id}</div><div className="text-xs text-slate-400 max-w-[180px] truncate">{w.title}</div></td><td className="px-3 py-2.5 text-slate-600 whitespace-nowrap">{a.name} <span className="text-slate-400">({a.code})</span></td><td className="px-3 py-2.5"><Badge variant={w.priority}>{w.priority}</Badge></td><td className="px-3 py-2.5"><Badge variant="status">{w.status}</Badge></td><td className="px-3 py-2.5 max-w-[120px] truncate">{u?.name ?? '—'}</td><td className={`px-3 py-2.5 whitespace-nowrap ${od ? 'text-red-600 font-bold' : ''}`}>{fmtDate(w.due_date)}{od ? ' ⚠' : ''}</td><td className="px-3 py-2.5 text-slate-400">{w.est_hrs} h</td><td className={`px-3 py-2.5 font-semibold ${sp > w.est_hrs ? 'text-red-600' : 'text-blue-700'}`}>{sp ? sp.toFixed(1) + ' h' : '—'}</td><td className="px-3 py-2.5 text-slate-400">{doneCt(w)}/{w.wo_tasks?.length ?? 0}</td></tr> })}
-        {list.length === 0 && <tr><td colSpan={9} className="px-3 py-8 text-center text-slate-400">No work orders. Click “+ New work order”.</td></tr>}</tbody></table>
+        <table className="w-full text-sm min-w-[860px]"><thead><tr className="bg-slate-50 text-slate-400 text-xs uppercase">{['Ticket', 'Type', 'Asset', 'Priority', 'Status', 'Start', 'Completion', 'Permit', 'Tasks'].map(h => <th key={h} className="text-left px-3 py-2.5 border-b border-slate-200 font-bold">{h}</th>)}</tr></thead>
+        <tbody>{list.map(w => { const a = assets.find(x => x.id === w.asset_id) || { name: '?', code: '?' }; const od = w.due_date && w.due_date < t && w.status !== 'Closed'; return <tr key={w.id} onClick={() => setOpenWO(w)} className="border-t border-slate-100 hover:bg-slate-50 cursor-pointer"><td className="px-3 py-2.5"><div className="font-bold">#{w.id}</div><div className="text-xs text-slate-400 max-w-[180px] truncate">{w.title}</div></td><td className="px-3 py-2.5"><KindBadge wo={w} /></td><td className="px-3 py-2.5 text-slate-600 whitespace-nowrap">{a.name} <span className="text-slate-400">({a.code})</span></td><td className="px-3 py-2.5"><Badge variant={w.priority}>{w.priority}</Badge></td><td className="px-3 py-2.5"><Badge variant="status">{w.status}</Badge></td><td className="px-3 py-2.5 whitespace-nowrap text-slate-600">{w.started_at ? fmtDateTime(w.started_at) : <span className="text-slate-300">—</span>}</td><td className="px-3 py-2.5 whitespace-nowrap text-slate-600">{w.completed_at ? fmtDateTime(w.completed_at) : <span className="text-slate-300">—</span>}</td><td className="px-3 py-2.5 text-xs">{w.permit_no || <span className="text-slate-300">—</span>}</td><td className="px-3 py-2.5 text-slate-400">{doneCt(w)}/{w.wo_tasks?.length ?? 0}</td></tr> })}
+        {list.length === 0 && <tr><td colSpan={9} className="px-3 py-8 text-center text-slate-400">No tickets here. Create one above.</td></tr>}</tbody></table>
       </Card>
       {openWO && <WOModal wo={workOrders.find(w => w.id === openWO.id) || openWO} onClose={() => setOpenWO(null)} />}
-      {creating && <CreateWOModal onClose={() => setCreating(false)} />}
+      {creating && <CreateWOModal prefill={{ type: createType }} onClose={() => setCreating(false)} />}
     </div>
   )
 }
@@ -456,7 +509,7 @@ function AssetsPage({ kind = 'all' }) {
     <div className="p-6">
       <div className="flex flex-wrap items-center gap-3 mb-4"><h1 className="text-xl font-black">{title}</h1><span className="text-xs text-slate-400">{filtered.length} records</span><div className="flex-1" />{perms.manageAssets && <Btn variant="teal" onClick={() => setAdding(true)}>+ Add asset</Btn>}</div>
       <Card>
-        <div className="flex px-4 py-2.5 border-b border-slate-100 bg-slate-50 rounded-t-2xl text-xs font-bold uppercase text-slate-400"><span className="flex-1">Name</span><span className="w-32">Code</span><span className="w-24">Status</span><span className="w-24">Open WOs</span></div>
+        <div className="flex px-4 py-2.5 border-b border-slate-100 bg-slate-50 rounded-t-2xl text-xs font-bold uppercase text-slate-400"><span className="flex-1">Name</span><span className="w-32">Code</span><span className="w-24">Status</span><span className="w-24">Open</span></div>
         {tree.map(({ a, depth, hasKids }) => { const wos = open.filter(w => w.asset_id === a.id); return <div key={a.id} className="flex items-center gap-2 px-4 py-2.5 border-t border-slate-100 text-sm hover:bg-slate-50"><span style={{ width: depth * 18 }} className="flex-shrink-0" />{hasKids ? <button onClick={() => setClosed(c => ({ ...c, [a.id]: !c[a.id] }))} className="w-5 text-center text-slate-400 font-bold hover:text-slate-700">{closed[a.id] ? '+' : '–'}</button> : <span className="w-5 text-center text-slate-300">·</span>}<span className="text-base">{KIND_IC[a.kind] || '🔩'}</span><span className="flex-1 truncate font-medium">{a.name}</span><span className="w-32 text-slate-400 text-xs truncate">{a.code}</span><span className="w-24">{perms.manageAssets ? <select value={a.status} onChange={e => setStatus(a, e.target.value)} className="text-xs border border-slate-300 rounded-lg px-1 py-0.5 bg-white"><option>Online</option><option>Offline</option></select> : <Pill on={a.status === 'Online'}>{a.status}</Pill>}</span><span className="w-24 flex gap-1 flex-wrap">{wos.length ? wos.map(w => <button key={w.id} onClick={() => setOpenWO(w)} className="text-xs font-bold bg-indigo-50 text-indigo-700 rounded-full px-2 py-0.5 hover:bg-indigo-100">#{w.id}</button>) : <span className="text-slate-300 text-xs">—</span>}</span></div> })}
         {tree.length === 0 && <p className="px-4 py-6 text-sm text-slate-400">No assets.</p>}
       </Card>
@@ -477,7 +530,7 @@ function TaskGroupsPage() {
   return (
     <div className="p-6">
       <div className="flex items-center gap-3 mb-4"><h1 className="text-xl font-black">Task Groups</h1><div className="flex-1" />{perms.manageTG && <Btn variant="teal" onClick={() => openEdit('new')}>+ New task group</Btn>}</div>
-      <p className="text-sm text-slate-400 mb-4">Reusable checklists used by Scheduled Maintenance and new work orders.</p>
+      <p className="text-sm text-slate-400 mb-4">Reusable checklists used by Scheduled Maintenance and new tickets.</p>
       <Card>{taskGroups.length === 0 ? <p className="px-4 py-6 text-sm text-slate-400">No task groups yet.</p> : taskGroups.map(g => { const tot = (g.task_group_items || []).reduce((s, t) => s + (parseFloat(t.est_hrs) || 0), 0); return <button key={g.id} onClick={() => openEdit(g)} className="flex items-center gap-3 px-4 py-3 border-t border-slate-100 w-full text-left hover:bg-slate-50 text-sm"><div className="flex-1 min-w-0"><div className="font-bold truncate">{g.name}</div>{g.asset_hint && <div className="text-xs text-slate-400">For: {g.asset_hint}</div>}</div><span className="text-slate-400 text-xs w-16">{g.task_group_items?.length ?? 0} tasks</span><span className="text-slate-400 text-xs w-20">{tot ? tot.toFixed(2) + ' h' : '—'}</span><span className="text-teal-700 font-bold text-xs">Edit</span></button> })}</Card>
       {editId && d && <Modal title={editId === 'new' ? 'New task group' : 'Edit task group'} onClose={() => { setEditId(null); setD(null) }} maxWidth="max-w-xl" footer={<div className="flex justify-between w-full">{editId !== 'new' ? <Btn variant="red" onClick={del}>Delete</Btn> : <span />}<div className="flex gap-2"><Btn variant="line" onClick={() => { setEditId(null); setD(null) }}>Cancel</Btn><Btn variant="teal" onClick={save}>Save</Btn></div></div>}>
         <div className="mb-3"><Lbl>Name</Lbl><Input value={d.name} onChange={e => setD(x => ({ ...x, name: e.target.value }))} placeholder="e.g. Electrical Monthly PM" /></div>
@@ -495,14 +548,14 @@ function ScheduledPage() {
   const [adding, setAdding] = useState(false)
   const [f, setF] = useState({ name: '', task_group_id: taskGroups[0]?.id || '', asset_id: assets[0]?.id || '', assigned_to: users[0]?.id || '', frequency: 'monthly', next_due: TODAY(), priority: 'High', lead_days: 3 })
   const tree = buildTree(assets)
-  const genNow = async sc => { const g = taskGroups.find(x => x.id === sc.task_group_id); const tasks = (g?.task_group_items || []).map((t, i) => ({ description: t.description, position: i, est_hrs: t.est_hrs })); const est = tasks.reduce((s, t) => s + (parseFloat(t.est_hrs) || 0), 0); const id = await createWO({ plant_id: sc.plant_id, asset_id: sc.asset_id, assigned_to: sc.assigned_to, title: sc.name, priority: sc.priority, type: 'Preventive', start_date: sc.next_due, due_date: advanceDate(sc.next_due, 'daily'), est_hrs: Math.round(est * 100) / 100 || 1, created_by: profile.id, tasks, log: [{ author_name: 'System', body: `Auto-generated from schedule: ${sc.name}` }] }); let nd = sc.next_due, g2 = 0; while (nd <= TODAY() && g2++ < 400) nd = advanceDate(nd, sc.frequency); await updSched(sc.id, { next_due: nd }); await rScheds(); await rWOs(); setFlash(`Work order #${id} generated.`) }
+  const genNow = async sc => { const g = taskGroups.find(x => x.id === sc.task_group_id); const tasks = (g?.task_group_items || []).map((t, i) => ({ description: t.description, position: i, est_hrs: t.est_hrs })); const id = await createWO({ plant_id: sc.plant_id, asset_id: sc.asset_id, assigned_to: sc.assigned_to, title: sc.name, priority: sc.priority, type: 'Preventive', start_date: sc.next_due, due_date: advanceDate(sc.next_due, 'daily'), created_by: profile.id, tasks, log: [{ author_name: 'System', body: `Auto-generated from schedule: ${sc.name}` }] }); let nd = sc.next_due, g2 = 0; while (nd <= TODAY() && g2++ < 400) nd = advanceDate(nd, sc.frequency); await updSched(sc.id, { next_due: nd }); await rScheds(); await rWOs(); setFlash(`PM ticket #${id} generated.`) }
   const add = async () => { if (!f.name.trim() || !f.task_group_id) { alert('Name and task group required.'); return } await saveSched({ ...f, plant_id: profile.plant_id, active: true }); await rScheds(); setAdding(false) }
   return (
     <div className="p-6">
       <div className="flex items-center gap-3 mb-4"><h1 className="text-xl font-black">Scheduled Maintenance</h1><div className="flex-1" /><Btn variant="teal" onClick={() => setAdding(true)}>+ New schedule</Btn></div>
-      <p className="text-sm text-slate-400 mb-4">Recurring PM plans. “Generate now” creates the next WO immediately.</p>
+      <p className="text-sm text-slate-400 mb-4">Recurring PM plans. “Generate now” creates the next PM ticket immediately.</p>
       <Card>{schedules.length === 0 ? <p className="px-4 py-6 text-sm text-slate-400">No schedules yet. Create a task group first, then a schedule.</p> : schedules.map(sc => { const g = taskGroups.find(x => x.id === sc.task_group_id) || { name: '?', task_group_items: [] }; const a = assets.find(x => x.id === sc.asset_id) || { name: '?' }; const u = users.find(x => x.id === sc.assigned_to) || { name: '?' }; const od = sc.next_due <= TODAY(); return <div key={sc.id} className="flex flex-wrap items-center gap-2 px-4 py-3 border-t border-slate-100 text-sm"><span className="text-base">{sc.active ? '🔁' : '⏸'}</span><div className="flex-1 min-w-0"><div className="font-bold truncate">{sc.name}</div><div className="text-xs text-slate-400">{a.name} · {g.name} ({g.task_group_items?.length ?? 0} tasks) · {u.name}</div></div><Badge variant={sc.priority}>{sc.priority}</Badge><Badge variant="status">{sc.frequency}</Badge><span className={`text-xs font-bold ${od ? 'text-red-600' : 'text-slate-500'}`}>Next: {fmtDate(sc.next_due)}</span><Btn variant="ghost" className="text-xs py-1 px-2.5" onClick={() => genNow(sc)}>Generate now</Btn><Btn variant="line" className="text-xs py-1 px-2.5" onClick={async () => { await updSched(sc.id, { active: !sc.active }); await rScheds() }}>{sc.active ? 'Pause' : 'Resume'}</Btn><Btn variant="red" className="text-xs py-1 px-2.5" onClick={async () => { if (confirm('Delete?')) { await delSched(sc.id); await rScheds() } }}>Delete</Btn></div> })}</Card>
-      {adding && <Modal title="New maintenance schedule" onClose={() => setAdding(false)} maxWidth="max-w-lg" footer={<><Btn variant="line" onClick={() => setAdding(false)}>Cancel</Btn><Btn variant="teal" onClick={add}>Create schedule</Btn></>}><div className="mb-3"><Lbl>Schedule name (becomes WO title)</Lbl><Input value={f.name} onChange={e => setF(o => ({ ...o, name: e.target.value }))} placeholder="e.g. Monthly PM — Taping m/c" /></div><div className="grid grid-cols-2 gap-3"><Field label="Task group"><Select value={f.task_group_id} onChange={e => setF(o => ({ ...o, task_group_id: e.target.value }))}><option value="">— Select —</option>{taskGroups.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}</Select></Field><Field label="Asset"><Select value={f.asset_id} onChange={e => setF(o => ({ ...o, asset_id: e.target.value }))}>{tree.map(n => <option key={n.a.id} value={n.a.id}>{'\u00A0'.repeat(n.depth * 2)}{n.a.name}</option>)}</Select></Field><Field label="Assign to"><Select value={f.assigned_to} onChange={e => setF(o => ({ ...o, assigned_to: e.target.value }))}>{users.map(u => <option key={u.id} value={u.id}>{u.name}</option>)}</Select></Field><Field label="Frequency"><Select value={f.frequency} onChange={e => setF(o => ({ ...o, frequency: e.target.value }))}><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option></Select></Field><Field label="Priority"><Select value={f.priority} onChange={e => setF(o => ({ ...o, priority: e.target.value }))}>{['High', 'Medium', 'Low'].map(x => <option key={x}>{x}</option>)}</Select></Field><Field label="First due date"><Input type="date" value={f.next_due} onChange={e => setF(o => ({ ...o, next_due: e.target.value }))} /></Field></div></Modal>}
+      {adding && <Modal title="New maintenance schedule" onClose={() => setAdding(false)} maxWidth="max-w-lg" footer={<><Btn variant="line" onClick={() => setAdding(false)}>Cancel</Btn><Btn variant="teal" onClick={add}>Create schedule</Btn></>}><div className="mb-3"><Lbl>Schedule name (becomes PM ticket title)</Lbl><Input value={f.name} onChange={e => setF(o => ({ ...o, name: e.target.value }))} placeholder="e.g. Monthly PM — Taping m/c" /></div><div className="grid grid-cols-2 gap-3"><Field label="Task group"><Select value={f.task_group_id} onChange={e => setF(o => ({ ...o, task_group_id: e.target.value }))}><option value="">— Select —</option>{taskGroups.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}</Select></Field><Field label="Asset"><Select value={f.asset_id} onChange={e => setF(o => ({ ...o, asset_id: e.target.value }))}>{tree.map(n => <option key={n.a.id} value={n.a.id}>{'\u00A0'.repeat(n.depth * 2)}{n.a.name}</option>)}</Select></Field><Field label="Assign to"><Select value={f.assigned_to} onChange={e => setF(o => ({ ...o, assigned_to: e.target.value }))}>{users.map(u => <option key={u.id} value={u.id}>{u.name}</option>)}</Select></Field><Field label="Frequency"><Select value={f.frequency} onChange={e => setF(o => ({ ...o, frequency: e.target.value }))}><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option></Select></Field><Field label="Priority"><Select value={f.priority} onChange={e => setF(o => ({ ...o, priority: e.target.value }))}>{['High', 'Medium', 'Low'].map(x => <option key={x}>{x}</option>)}</Select></Field><Field label="First due date"><Input type="date" value={f.next_due} onChange={e => setF(o => ({ ...o, next_due: e.target.value }))} /></Field></div></Modal>}
     </div>
   )
 }
@@ -532,9 +585,9 @@ function WorkRequestsPage() {
   const onConv = async woId => { await saveWReq({ ...converting, status: 'Converted', wo_id: woId }); await rWReqs(); await rWOs(); setConverting(null) }
   return (
     <div className="p-6">
-      <h1 className="text-xl font-black mb-2">Work Requests</h1><p className="text-sm text-slate-400 mb-4">Convert to a work order or reject.</p>
-      <Card>{workReqs.length === 0 ? <p className="px-4 py-6 text-sm text-slate-400">No work requests.</p> : workReqs.map(r => { const a = assets.find(x => x.id === r.asset_id) || { name: '?' }; const u = users.find(x => x.id === r.raised_by); return <div key={r.id} className="px-4 py-3 border-t border-slate-100"><div className="flex flex-wrap gap-2 items-center mb-1"><span className="font-bold text-sm">{r.title}</span><Badge variant={r.priority}>{r.priority}</Badge><Badge variant={rb(r.status)}>{r.status}</Badge>{r.wo_id && <span className="text-xs font-bold bg-indigo-50 text-indigo-700 rounded-full px-2 py-0.5">→ WO #{r.wo_id}</span>}</div><div className="text-xs text-slate-400 mb-1">{a.name} · by {u?.name || '—'} · {fmtDateTime(r.created_at)}</div>{r.description && <p className="text-sm mb-2">{r.description}</p>}{r.note && <div className="text-xs text-red-600 mb-1">Rejected: {r.note}</div>}{r.status === 'Pending' && <div className="flex gap-2 mt-2"><Btn variant="teal" className="text-xs py-1.5 px-3" onClick={() => setConverting(r)}>Convert to WO</Btn><Btn variant="red" className="text-xs py-1.5 px-3" onClick={() => reject(r)}>Reject</Btn></div>}</div> })}</Card>
-      {converting && <CreateWOModal prefill={{ title: converting.title, asset_id: converting.asset_id, priority: converting.priority, desc: converting.description, fromReq: true }} onClose={() => setConverting(null)} onCreated={onConv} />}
+      <h1 className="text-xl font-black mb-2">Work Requests</h1><p className="text-sm text-slate-400 mb-4">Convert to a breakdown work order or reject.</p>
+      <Card>{workReqs.length === 0 ? <p className="px-4 py-6 text-sm text-slate-400">No work requests.</p> : workReqs.map(r => { const a = assets.find(x => x.id === r.asset_id) || { name: '?' }; const u = users.find(x => x.id === r.raised_by); return <div key={r.id} className="px-4 py-3 border-t border-slate-100"><div className="flex flex-wrap gap-2 items-center mb-1"><span className="font-bold text-sm">{r.title}</span><Badge variant={r.priority}>{r.priority}</Badge><Badge variant={rb(r.status)}>{r.status}</Badge>{r.wo_id && <span className="text-xs font-bold bg-indigo-50 text-indigo-700 rounded-full px-2 py-0.5">→ WO #{r.wo_id}</span>}</div><div className="text-xs text-slate-400 mb-1">{a.name} · by {u?.name || '—'} · {fmtDateTime(r.created_at)}</div>{r.description && <p className="text-sm mb-2">{r.description}</p>}{r.note && <div className="text-xs text-red-600 mb-1">Rejected: {r.note}</div>}{r.status === 'Pending' && <div className="flex gap-2 mt-2"><Btn variant="teal" className="text-xs py-1.5 px-3" onClick={() => setConverting(r)}>Convert to work order</Btn><Btn variant="red" className="text-xs py-1.5 px-3" onClick={() => reject(r)}>Reject</Btn></div>}</div> })}</Card>
+      {converting && <CreateWOModal prefill={{ title: converting.title, asset_id: converting.asset_id, priority: converting.priority, desc: converting.description, fromReq: true, type: 'Corrective' }} onClose={() => setConverting(null)} onCreated={onConv} />}
     </div>
   )
 }
@@ -582,8 +635,8 @@ function ActiveInsightsPage() {
   const top = Object.entries(byA).sort((a, b) => b[1] - a[1]).slice(0, 6); const mxAs = Math.max(...top.map(x => x[1]), 1)
   return (
     <div className="p-6"><h1 className="text-xl font-black mb-4">Active Work Order Insights</h1>
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-5"><KPICard title="Open" value={open.length} color="text-teal-700" /><KPICard title="Overdue" value={open.filter(w => w.due_date && w.due_date < t).length} color="text-red-600" /><KPICard title="Backlog" value={open.reduce((s, w) => s + (w.est_hrs || 0), 0).toFixed(1) + ' h'} /><KPICard title="In progress" value={open.filter(w => w.status === 'In Progress').length} color="text-blue-700" /></div>
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4"><Card><CardHead>By priority</CardHead><div className="py-2"><HBar label="High" value={byPri.High} max={mxP} color="#DC2626" /><HBar label="Medium" value={byPri.Medium} max={mxP} color="#D97706" /><HBar label="Low" value={byPri.Low} max={mxP} color="#16A34A" /></div></Card><Card><CardHead>Aging</CardHead><div className="py-2">{Object.entries(aging).map(([k, v], i) => <HBar key={k} label={k} value={v} max={mxA} color={['#16A34A', '#D97706', '#EA580C', '#DC2626'][i]} />)}</div></Card><Card><CardHead>Top assets by open WOs</CardHead><div className="py-2">{top.length ? top.map(([k, v]) => <HBar key={k} label={k} value={v} max={mxAs} color="#1D4ED8" />) : <p className="px-4 py-3 text-sm text-slate-400">Nothing open.</p>}</div></Card></div>
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-5"><KPICard title="Open" value={open.length} color="text-teal-700" /><KPICard title="Overdue" value={open.filter(w => w.due_date && w.due_date < t).length} color="text-red-600" /><KPICard title="PM open" value={open.filter(isPM).length} color="text-teal-700" /><KPICard title="Breakdown open" value={open.filter(w => !isPM(w)).length} color="text-rose-700" /></div>
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4"><Card><CardHead>By priority</CardHead><div className="py-2"><HBar label="High" value={byPri.High} max={mxP} color="#DC2626" /><HBar label="Medium" value={byPri.Medium} max={mxP} color="#D97706" /><HBar label="Low" value={byPri.Low} max={mxP} color="#16A34A" /></div></Card><Card><CardHead>Aging</CardHead><div className="py-2">{Object.entries(aging).map(([k, v], i) => <HBar key={k} label={k} value={v} max={mxA} color={['#16A34A', '#D97706', '#EA580C', '#DC2626'][i]} />)}</div></Card><Card><CardHead>Top assets by open</CardHead><div className="py-2">{top.length ? top.map(([k, v]) => <HBar key={k} label={k} value={v} max={mxAs} color="#1D4ED8" />) : <p className="px-4 py-3 text-sm text-slate-400">Nothing open.</p>}</div></Card></div>
     </div>
   )
 }
@@ -593,16 +646,17 @@ function ClosedInsightsPage() {
   const closed = workOrders.filter(w => w.status === 'Closed')
   const onTime = closed.filter(w => w.closed_on && w.closed_on <= w.due_date)
   const comp = closed.length ? onTime.length / closed.length : 0
-  const est = closed.reduce((s, w) => s + (w.est_hrs || 0), 0), sp = closed.reduce((s, w) => s + spentHrs(w), 0)
+  const durs = closed.map(durationHrs).filter(x => x != null)
+  const avgDur = durs.length ? durs.reduce((a, b) => a + b, 0) / durs.length : null
   const res = { OK: 0, Adjusted: 0, Replaced: 0, 'Needs attention': 0 }
   closed.forEach(w => (w.wo_tasks || []).forEach(t => { if (t.result && res[t.result] !== undefined) res[t.result]++ }))
   const mxR = Math.max(...Object.values(res), 1)
-  const byType = { Preventive: closed.filter(w => w.type === 'Preventive').length, Corrective: closed.filter(w => w.type === 'Corrective').length }
+  const byType = { 'PM Tickets': closed.filter(isPM).length, 'Breakdowns': closed.filter(w => !isPM(w)).length }
   const mxT = Math.max(...Object.values(byType), 1)
   return (
     <div className="p-6"><h1 className="text-xl font-black mb-4">Closed Work Order Insights</h1>
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-5"><Card className="flex items-center gap-4 p-4 col-span-2"><div className="text-center"><GaugeSVG pct={comp} /><div className="text-xs text-slate-400">on time</div></div><div><div className="text-xs font-bold uppercase text-slate-400 mb-1">Compliance</div><div className="text-xs text-slate-400">{onTime.length} of {closed.length} on time</div></div></Card><KPICard title="Closed" value={closed.length} color="text-slate-500" /><KPICard title="Spent / est" value={sp.toFixed(1) + ' / ' + est.toFixed(1) + ' h'} color="text-blue-700" sub={est ? Math.round(sp / est * 100) + '% accuracy' : ''} /></div>
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4"><Card><CardHead>Task results</CardHead><div className="py-2"><HBar label="OK" value={res.OK} max={mxR} color="#16A34A" /><HBar label="Adjusted" value={res.Adjusted} max={mxR} color="#D97706" /><HBar label="Replaced" value={res.Replaced} max={mxR} color="#1D4ED8" /><HBar label="Needs attention" value={res['Needs attention']} max={mxR} color="#DC2626" /></div></Card><Card><CardHead>By type</CardHead><div className="py-2"><HBar label="Preventive" value={byType.Preventive} max={mxT} color="#0F766E" /><HBar label="Corrective" value={byType.Corrective} max={mxT} color="#EA580C" /></div></Card></div>
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-5"><Card className="flex items-center gap-4 p-4 col-span-2"><div className="text-center"><GaugeSVG pct={comp} /><div className="text-xs text-slate-400">on time</div></div><div><div className="text-xs font-bold uppercase text-slate-400 mb-1">Compliance</div><div className="text-xs text-slate-400">{onTime.length} of {closed.length} on time</div></div></Card><KPICard title="Closed" value={closed.length} color="text-slate-500" /><KPICard title="Avg duration" value={avgDur != null ? avgDur.toFixed(1) + ' h' : '—'} color="text-blue-700" sub={durs.length ? `from ${durs.length} timed jobs` : 'no timed jobs yet'} /></div>
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4"><Card><CardHead>Task results</CardHead><div className="py-2"><HBar label="OK" value={res.OK} max={mxR} color="#16A34A" /><HBar label="Adjusted" value={res.Adjusted} max={mxR} color="#D97706" /><HBar label="Replaced" value={res.Replaced} max={mxR} color="#1D4ED8" /><HBar label="Needs attention" value={res['Needs attention']} max={mxR} color="#DC2626" /></div></Card><Card><CardHead>By type</CardHead><div className="py-2"><HBar label="PM Tickets" value={byType['PM Tickets']} max={mxT} color="#0F766E" /><HBar label="Breakdowns" value={byType['Breakdowns']} max={mxT} color="#E11D48" /></div></Card></div>
     </div>
   )
 }
@@ -663,57 +717,143 @@ function UsersPage() {
   )
 }
 
-function CalendarPage() {
-  const { workOrders, assets } = useApp()
-  const [y, setY] = useState(new Date().getFullYear())
-  const [m, setM] = useState(new Date().getMonth())
-  const [fSt, setFSt] = useState('All')
-  const [fPr, setFPr] = useState('All')
+/* ══════════════════════════════════════════════════════════════════════════
+   PM SCHEDULE  — Section → Line → Asset → month calendar of PM tickets
+   (renamed from "Calendar"; shows PM tickets only, drill-down by asset)
+   ══════════════════════════════════════════════════════════════════════════ */
+function PMSchedulePage() {
+  const { assets, workOrders } = useApp()
+  const [sel, setSel] = useState({ section: null, line: null, asset: null })
+  const [ym, setYm] = useState(() => { const d = new Date(); return { y: d.getFullYear(), m: d.getMonth() } })
   const [openWO, setOpenWO] = useState(null)
+
+  // Derive the hierarchy from the asset tree: depth 0 = section, 1 = line, 2+ = machine/asset.
+  // We treat "location" kind as section, "line" kind as line; anything with children is a group.
+  const tree = buildTree(assets)
+  const sections = tree.filter(n => n.depth === 0)
+  const childrenOf = pid => assets.filter(a => (a.parent_id || null) === pid)
+
+  // fallback: if there is no explicit hierarchy, offer a flat asset list at the asset step
+  const pmFor = assetId => workOrders.filter(w => isPM(w) && w.asset_id === assetId)
+
+  const crumb = (label, active, done, onClick) =>
+    <button onClick={onClick} className={`px-3 py-1.5 rounded-full text-sm font-bold border ${active ? 'bg-teal-700 text-white border-teal-700' : done ? 'bg-teal-50 text-teal-800 border-teal-200 hover:bg-teal-100' : 'bg-white text-slate-600 border-slate-200'}`}>{label}</button>
+
+  const PickCard = ({ icon, bg, title, subtitle, onClick }) =>
+    <button onClick={onClick} className="w-full flex items-center gap-4 p-4 border border-slate-200 rounded-2xl bg-white text-left hover:border-teal-400 hover:bg-teal-50 transition-colors">
+      <div className="w-11 h-11 rounded-xl flex items-center justify-center text-xl flex-shrink-0" style={{ background: bg }}>{icon}</div>
+      <div className="min-w-0"><div className="font-bold text-sm truncate">{title}</div><div className="text-xs text-slate-400">{subtitle}</div></div>
+      <span className="ml-auto text-teal-600 font-black">→</span>
+    </button>
+
+  // Breadcrumb bar
+  const bar = (
+    <div className="flex items-center gap-2 flex-wrap mb-5">
+      {crumb('Sections', !sel.section, !!sel.section, () => setSel({ section: null, line: null, asset: null }))}
+      {sel.section && <span className="text-slate-300 font-black">›</span>}
+      {sel.section && crumb(assets.find(a => a.id === sel.section)?.name || 'Section', !sel.line, !!sel.line, () => setSel(s => ({ section: s.section, line: null, asset: null })))}
+      {sel.line && <span className="text-slate-300 font-black">›</span>}
+      {sel.line && crumb(assets.find(a => a.id === sel.line)?.name || 'Line', !sel.asset, !!sel.asset, () => setSel(s => ({ section: s.section, line: s.line, asset: null })))}
+      {sel.asset && <span className="text-slate-300 font-black">›</span>}
+      {sel.asset && crumb(assets.find(a => a.id === sel.asset)?.name || 'Asset', true, false, () => {})}
+    </div>
+  )
+
+  // STEP 1 — sections
+  if (!sel.section) {
+    return (
+      <div className="p-6">
+        <h1 className="text-xl font-black mb-1">PM Schedule</h1>
+        <p className="text-sm text-slate-400 mb-5">Drill down to an asset to see its PM calendar.</p>
+        {bar}
+        {sections.length === 0
+          ? <Note>No top-level sections found. Add assets with a hierarchy (facility → line → equipment) in the Assets page, or pick from all assets below.</Note>
+          : <div className="grid gap-3 max-w-2xl">{sections.map(n => { const lines = childrenOf(n.a.id); return <PickCard key={n.a.id} icon={KIND_IC[n.a.kind] || '🏭'} bg="#CCFBF1" title={n.a.name} subtitle={`${lines.length} line${lines.length !== 1 ? 's' : ''}`} onClick={() => setSel({ section: n.a.id, line: null, asset: null })} />})}</div>}
+        {/* Fallback: flat asset shortcut */}
+        {sections.length === 0 && <div className="grid gap-3 max-w-2xl mt-3">{assets.map(a => <PickCard key={a.id} icon="🔩" bg="#F1F5F9" title={a.name} subtitle={`${a.code} · ${pmFor(a.id).length} PM tickets`} onClick={() => setSel({ section: 'flat', line: 'flat', asset: a.id })} />)}</div>}
+      </div>
+    )
+  }
+
+  // STEP 2 — lines under the section
+  if (!sel.line) {
+    const lines = childrenOf(sel.section)
+    return (
+      <div className="p-6">
+        <h1 className="text-xl font-black mb-1">PM Schedule</h1>
+        <p className="text-sm text-slate-400 mb-5">Select a line.</p>
+        {bar}
+        {lines.length === 0
+          ? <Note>No lines under this section. <button className="underline font-bold" onClick={() => setSel(s => ({ section: s.section, line: 'direct', asset: null }))}>Show assets directly →</button></Note>
+          : <div className="grid gap-3 max-w-2xl">{lines.map(l => { const machines = childrenOf(l.id); return <PickCard key={l.id} icon={KIND_IC[l.kind] || '🔗'} bg="#DBEAFE" title={l.name} subtitle={`${machines.length} asset${machines.length !== 1 ? 's' : ''}`} onClick={() => setSel(s => ({ section: s.section, line: l.id, asset: null }))} />})}</div>}
+      </div>
+    )
+  }
+
+  // STEP 3 — assets under the line
+  if (!sel.asset) {
+    const machines = sel.line === 'direct' ? childrenOf(sel.section) : childrenOf(sel.line)
+    return (
+      <div className="p-6">
+        <h1 className="text-xl font-black mb-1">PM Schedule</h1>
+        <p className="text-sm text-slate-400 mb-5">Select an asset.</p>
+        {bar}
+        {machines.length === 0
+          ? <Note>No assets here.</Note>
+          : <div className="grid gap-3 max-w-2xl">{machines.map(a => { const n = pmFor(a.id).length; return <PickCard key={a.id} icon={KIND_IC[a.kind] || '🔩'} bg="#F1F5F9" title={a.name} subtitle={`${a.code} · ${n} PM ticket${n !== 1 ? 's' : ''}`} onClick={() => setSel(s => ({ section: s.section, line: s.line, asset: a.id }))} />})}</div>}
+      </div>
+    )
+  }
+
+  // STEP 4 — calendar for the chosen asset (PM tickets only)
+  const { y, m } = ym
   const MN = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
   const days = new Date(y, m + 1, 0).getDate()
   const lead = new Date(y, m, 1).getDay()
-  const iso = d => `${y}-${String(m + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`
+  const isoOf = d => `${y}-${String(m + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`
   const t = TODAY()
-  const nav = delta => { let nm = m + delta, ny = y; if (nm < 0) { nm = 11; ny-- } if (nm > 11) { nm = 0; ny++ } setM(nm); setY(ny) }
-  const vis = workOrders.filter(w => { if (fSt !== 'All' && w.status !== fSt) return false; if (fPr !== 'All' && w.priority !== fPr) return false; return true })
-  const byDay = {}
-  vis.forEach(w => { if (w.start_date) { (byDay[w.start_date] = byDay[w.start_date] || []).push(w) } })
+  const nav = delta => { let nm = m + delta, ny = y; if (nm < 0) { nm = 11; ny-- } if (nm > 11) { nm = 0; ny++ } setYm({ y: ny, m: nm }) }
+  const mine = pmFor(sel.asset).filter(w => w.start_date)
+  const byDay = {}; mine.forEach(w => { (byDay[w.start_date] = byDay[w.start_date] || []).push(w) })
+  const assetName = assets.find(a => a.id === sel.asset)?.name || 'asset'
+
   return (
     <div className="p-6">
-      <div className="flex flex-wrap gap-2 items-center mb-4">
-        <Btn variant="ghost" onClick={() => { setY(new Date().getFullYear()); setM(new Date().getMonth()) }}>Today</Btn>
-        <Btn variant="line" onClick={() => nav(-1)}>‹</Btn>
-        <Btn variant="line" onClick={() => nav(1)}>›</Btn>
-        <h1 className="text-xl font-black ml-1">{MN[m]} {y}</h1>
-        <div className="flex-1" />
-        <Select value={fSt} onChange={e => setFSt(e.target.value)} className="w-auto"><option value="All">Status: All</option>{['Open', 'In Progress', 'Closed'].map(s => <option key={s}>{s}</option>)}</Select>
-        <Select value={fPr} onChange={e => setFPr(e.target.value)} className="w-auto"><option value="All">Priority: All</option>{['High', 'Medium', 'Low'].map(s => <option key={s}>{s}</option>)}</Select>
-      </div>
+      <h1 className="text-xl font-black mb-1">PM Schedule</h1>
+      <p className="text-sm text-slate-400 mb-5">PM tickets for <b>{assetName}</b> — click a ticket to open it.</p>
+      {bar}
       <Card className="overflow-hidden">
+        <div className="flex items-center gap-2 px-4 py-3">
+          <Btn variant="ghost" onClick={() => { const d = new Date(); setYm({ y: d.getFullYear(), m: d.getMonth() }) }}>Today</Btn>
+          <Btn variant="line" onClick={() => nav(-1)}>‹</Btn>
+          <Btn variant="line" onClick={() => nav(1)}>›</Btn>
+          <b className="text-base ml-1">{MN[m]} {y}</b>
+          <div className="flex-1" />
+          <span className="text-xs text-slate-400">{mine.length} PM ticket{mine.length !== 1 ? 's' : ''} on this asset</span>
+        </div>
         <div className="grid grid-cols-7">
           {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(d => <div key={d} className="px-2 py-2 text-center text-xs font-bold uppercase tracking-wide text-slate-400 bg-slate-50 border-b border-slate-200">{d}</div>)}
           {Array.from({ length: lead }).map((_, i) => <div key={'e' + i} className="min-h-24 bg-slate-50 border-b border-r border-slate-100" />)}
           {Array.from({ length: days }).map((_, i) => {
-            const d = i + 1, di = iso(d), list = byDay[di] || []
+            const d = i + 1, di = isoOf(d), list = byDay[di] || []
             return (
               <div key={d} className="min-h-24 border-b border-r border-slate-100 p-1">
                 <div className={`w-6 h-6 flex items-center justify-center text-xs font-bold rounded-full mb-1 ${di === t ? 'bg-teal-600 text-white' : 'text-slate-400'}`}>{d}</div>
                 {list.map(w => {
-                  const a = assets.find(x => x.id === w.asset_id) || { code: '?' }
                   const cls = w.status === 'Closed' ? 'bg-slate-100 border-slate-400 text-slate-500' : { High: 'bg-red-50 border-red-500 text-red-700', Medium: 'bg-amber-50 border-amber-500 text-amber-700', Low: 'bg-green-50 border-green-500 text-green-700' }[w.priority]
-                  return <button key={w.id} onClick={() => setOpenWO(w)} title={w.title} className={`block w-full text-left border-l-4 rounded text-xs px-1 py-0.5 mb-0.5 hover:opacity-80 truncate ${cls}`}><b>#{w.id}</b> {a.code}</button>
+                  return <button key={w.id} onClick={() => setOpenWO(w)} title={w.title} className={`block w-full text-left border-l-4 rounded text-xs px-1 py-0.5 mb-0.5 hover:opacity-80 truncate ${cls}`}><b>#{w.id}</b> {w.status === 'Closed' ? '✓ ' : ''}{w.title}</button>
                 })}
               </div>
             )
           })}
         </div>
+        <div className="flex gap-4 px-4 py-3 text-xs text-slate-400 flex-wrap">{[['High', 'bg-red-500'], ['Medium', 'bg-amber-500'], ['Low', 'bg-green-500'], ['Closed', 'bg-slate-400']].map(([l, c]) => <span key={l}><span className={`inline-block w-3 h-3 rounded ${c} mr-1.5 align-middle`} />{l}</span>)}<span className="ml-auto">✓ = completed</span></div>
       </Card>
-      <div className="flex gap-4 mt-3 text-xs text-slate-400 flex-wrap">{[['High', 'bg-red-500'], ['Medium', 'bg-amber-500'], ['Low', 'bg-green-500'], ['Closed', 'bg-slate-400']].map(([l, c]) => <span key={l}><span className={`inline-block w-3 h-3 rounded ${c} mr-1.5 align-middle`} />{l}</span>)}</div>
       {openWO && <WOModal wo={workOrders.find(w => w.id === openWO.id) || openWO} onClose={() => setOpenWO(null)} />}
     </div>
   )
 }
+
 /* ══════════════════════════════════════════════════════════════════════════
    HISTORY & INSIGHTS
    ══════════════════════════════════════════════════════════════════════════ */
@@ -721,6 +861,7 @@ function HistoryPage() {
   const { workOrders, assets } = useApp()
   const [assetF, setAssetF] = useState('all')
   const [rangeF, setRangeF] = useState('all')
+  const [kindF, setKindF] = useState('all') // all | PM | BD
   const t = TODAY()
 
   const cutoff = (() => {
@@ -734,20 +875,19 @@ function HistoryPage() {
     return ref ? ref >= cutoff : true
   }
   const matchAsset = w => assetF === 'all' || w.asset_id === assetF
+  const matchKind = w => kindF === 'all' || (kindF === 'PM' ? isPM(w) : !isPM(w))
 
-  const scoped = workOrders.filter(w => inRange(w) && matchAsset(w))
+  const scoped = workOrders.filter(w => inRange(w) && matchAsset(w) && matchKind(w))
   const closed = scoped.filter(w => w.status === 'Closed')
   const pending = scoped.filter(w => w.status !== 'Closed')
   const overdue = pending.filter(w => w.due_date && w.due_date < t)
   const completion = scoped.length ? Math.round(closed.length / scoped.length * 100) : 0
 
-  const closeDurations = closed
-    .map(w => (w.closed_on && w.start_date) ? (Date.parse(w.closed_on) - Date.parse(w.start_date)) / 86400000 : null)
-    .filter(x => x != null && x >= 0)
-  const avgClose = closeDurations.length ? (closeDurations.reduce((a, b) => a + b, 0) / closeDurations.length) : null
+  const durs = closed.map(durationHrs).filter(x => x != null)
+  const avgDur = durs.length ? durs.reduce((a, b) => a + b, 0) / durs.length : null
 
   const rows = assets.map(a => {
-    const list = workOrders.filter(w => w.asset_id === a.id && inRange(w))
+    const list = workOrders.filter(w => w.asset_id === a.id && inRange(w) && matchKind(w))
     const cl = list.filter(w => w.status === 'Closed').length
     const pe = list.filter(w => w.status !== 'Closed').length
     const od = list.filter(w => w.status !== 'Closed' && w.due_date && w.due_date < t).length
@@ -773,20 +913,24 @@ function HistoryPage() {
           <option value="365">Last 12 months</option>
         </Select>
       </div>
+      <div className="inline-flex bg-slate-100 rounded-xl p-1 mb-3 mt-2">
+        {[['all', 'All'], ['PM', 'PM Tickets'], ['BD', 'Breakdown']].map(([k, l]) =>
+          <button key={k} onClick={() => setKindF(k)} className={`px-4 py-1.5 rounded-lg text-sm font-bold ${kindF === k ? 'bg-white shadow text-slate-900' : 'text-slate-500'}`}>{l}</button>)}
+      </div>
       <p className="text-sm text-slate-400 mb-5">{rangeLabel}{assetF !== 'all' ? ` · ${assets.find(a => a.id === assetF)?.name || ''}` : ' · all machines'}</p>
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-5">
-        <KPICard title="Total work orders" value={scoped.length} />
+        <KPICard title="Total tickets" value={scoped.length} />
         <KPICard title="Closed" value={closed.length} color="text-teal-700" sub={`${completion}% completion`} />
         <KPICard title="Pending / open" value={pending.length} color="text-blue-700" />
         <KPICard title="Overdue" value={overdue.length} color={overdue.length ? 'text-red-600' : 'text-slate-400'} />
       </div>
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-6">
-        <KPICard title="Avg time to close" value={avgClose != null ? avgClose.toFixed(1) + ' d' : '—'} />
-        <KPICard title="Preventive closed" value={closed.filter(w => w.type === 'Preventive').length} color="text-teal-700" />
-        <KPICard title="Corrective closed" value={closed.filter(w => w.type === 'Corrective').length} color="text-amber-700" />
-        <KPICard title="Total hours logged" value={scoped.reduce((s, w) => s + spentHrs(w), 0).toFixed(0) + ' h'} color="text-blue-700" />
+        <KPICard title="Avg actual duration" value={avgDur != null ? avgDur.toFixed(1) + ' h' : '—'} sub={durs.length ? `${durs.length} timed jobs` : 'no timed jobs yet'} />
+        <KPICard title="PM closed" value={closed.filter(isPM).length} color="text-teal-700" />
+        <KPICard title="Breakdown closed" value={closed.filter(w => !isPM(w)).length} color="text-rose-700" />
+        <KPICard title="Timed jobs" value={durs.length} color="text-blue-700" />
       </div>
 
       <Card className="overflow-x-auto">
@@ -816,7 +960,7 @@ function HistoryPage() {
                 </td>
               </tr>
             ))}
-            {rows.length === 0 && <tr><td colSpan={6} className="px-3 py-8 text-center text-slate-400">No work orders in this period.</td></tr>}
+            {rows.length === 0 && <tr><td colSpan={6} className="px-3 py-8 text-center text-slate-400">No tickets in this period.</td></tr>}
           </tbody>
         </table>
       </Card>
@@ -844,7 +988,7 @@ function Sidebar() {
         <Head>Dashboard</Head>
         <Item to="/" icon="▦" label="Dashboard" />
         <Item to="/work-orders" icon="☰" label="Work Orders" />
-        <Item to="/calendar" icon="📅" label="Calendar" />
+        <Item to="/pm-schedule" icon="🗓️" label="PM Schedule" />
         <Item to="/assigned-wos" icon="✅" label="Assigned to me" />
         <Head>Maintenance</Head>
         <Item to="/scheduled" icon="🔁" label="Scheduled Maintenance" />
@@ -889,7 +1033,7 @@ function Layout() {
           <Routes>
             <Route path="/" element={<DashboardPage />} />
             <Route path="/work-orders" element={<WorkOrdersPage />} />
-            <Route path="/calendar" element={<CalendarPage />} />
+            <Route path="/pm-schedule" element={<PMSchedulePage />} />
             <Route path="/assigned-wos" element={<WorkOrdersPage mine />} />
             <Route path="/scheduled" element={<ScheduledPage />} />
             <Route path="/task-groups" element={<TaskGroupsPage />} />
@@ -914,38 +1058,7 @@ function Layout() {
     </div>
   )
 }
-/* ══════════════════════════════════════════════════════════════════════════
-   PASSWORD GATE  — shared password for the whole plant
-   Change PASSWORD below to whatever you want everyone to type.
-   ══════════════════════════════════════════════════════════════════════════ */
-function Gate({ children }) {
-  const PASSWORD = 'uluberia2026'
-  const [ok, setOk] = useState(() => sessionStorage.getItem('pc_gate') === 'yes')
-  const [pw, setPw] = useState('')
-  const [err, setErr] = useState('')
-  if (ok) return children
-  const submit = () => {
-    if (pw === PASSWORD) { sessionStorage.setItem('pc_gate', 'yes'); setOk(true) }
-    else setErr('Wrong password. Try again.')
-  }
-  return (
-    <div className="min-h-screen flex items-center justify-center p-6 bg-gradient-to-br from-slate-900 to-teal-900">
-      <div className="w-full max-w-sm">
-        <div className="flex items-center justify-center gap-3 mb-3">
-          <div className="w-10 h-10 bg-teal-400 rounded-2xl flex items-center justify-center text-white font-black text-xl">P</div>
-          <div className="text-white text-2xl font-black">PlantCare</div>
-        </div>
-        <p className="text-slate-400 text-center text-sm mb-8">ITC PCPB — Uluberia Plant</p>
-        <div className="bg-white rounded-2xl shadow-2xl p-6">
-          <div className="font-bold text-base mb-4">Enter password</div>
-          {err && <div className="bg-red-50 border border-red-200 text-red-700 text-sm rounded-xl px-3 py-2.5 mb-4">{err}</div>}
-          <input type="password" value={pw} onChange={e => { setPw(e.target.value); setErr('') }} onKeyDown={e => e.key === 'Enter' && submit()} autoFocus placeholder="Password" className="w-full border border-slate-300 rounded-xl px-3 py-2.5 text-sm mb-4 focus:outline-none focus:ring-2 focus:ring-teal-600" />
-          <button onClick={submit} className="w-full bg-teal-700 hover:bg-teal-800 text-white font-bold rounded-xl py-3 text-sm">Enter</button>
-        </div>
-      </div>
-    </div>
-  )
-}
+
 export default function App() {
   return (
     <AppProvider>
