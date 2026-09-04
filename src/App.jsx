@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, createContext, useContext } from 'react'
 import { BrowserRouter, Routes, Route, NavLink, Navigate } from 'react-router-dom'
 import { createClient } from '@supabase/supabase-js'
+import { MASTER } from './masterData'
 
 /* ══════════════════════════════════════════════════════════════════════════
    SUPABASE  — the one place credentials live
@@ -21,6 +22,7 @@ const fmtDate = iso => { if (!iso) return '—'; const d = new Date(iso); return
 const fmtDateTime = iso => { if (!iso) return '—'; const d = new Date(iso); return isNaN(d) ? iso : d.toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) }
 const doneCt = wo => (wo.wo_tasks || []).filter(t => t.done).length
 const spentHrs = wo => (wo.wo_tasks || []).reduce((s, t) => s + (parseFloat(t.hrs_spent) || 0), 0)
+const estHrs = wo => (wo.wo_tasks || []).reduce((s, t) => s + (parseFloat(t.est_hrs) || 0), 0)
 const PRIORITY_COLOR = { High: '#DC2626', Medium: '#D97706', Low: '#16A34A' }
 const KIND_IC = { location: '🏭', line: '🔗', equipment: '🔩', tool: '🧰' }
 
@@ -107,6 +109,41 @@ const saveWReq = r => supabase.from('work_requests').upsert(r)
 const savePReq = r => supabase.from('purchase_requests').upsert(r)
 
 /* ══════════════════════════════════════════════════════════════════════════
+   ROLES, PERMISSIONS & CREWS  — one source of truth
+   The rows below drive BOTH what the app actually allows (permsFor) AND the
+   on-screen "Role permission matrix" in Settings, so the two can never drift.
+   ══════════════════════════════════════════════════════════════════════════ */
+const ROLES = { admin: 'Administrator', manager: 'Maintenance Manager', technician: 'Technician' }
+const ROLE_ORDER = ['admin', 'manager', 'technician']
+// each capability = one enforced perm key + its human label
+const PERM_ROWS = [
+  { key: 'viewAll', label: 'See all work orders' },
+  { key: 'edit', label: 'Edit / assign work orders' },
+  { key: 'create', label: 'Create work orders' },
+  { key: 'approve', label: 'Approve requests' },
+  { key: 'manageAssets', label: 'Add / edit assets' },
+  { key: 'manageTG', label: 'Manage task groups' },
+  { key: 'manageUsers', label: 'Manage users & groups' },
+]
+const ROLE_MATRIX = {
+  admin:      { viewAll: 1, edit: 1, create: 1, approve: 1, manageAssets: 1, manageTG: 1, manageUsers: 1 },
+  manager:    { viewAll: 1, edit: 1, create: 1, approve: 1, manageAssets: 1, manageTG: 1, manageUsers: 0 },
+  technician: { viewAll: 0, edit: 0, create: 0, approve: 0, manageAssets: 0, manageTG: 0, manageUsers: 0 },
+}
+const permsFor = role => Object.fromEntries(PERM_ROWS.map(r => [r.key, !!(ROLE_MATRIX[role] || ROLE_MATRIX.technician)[r.key]]))
+// maintenance crews (the "Group" column in Settings). Manufacturing & Packing
+// stay separate all the way down; crews are the people who service them.
+const CREWS = [
+  { id: 'plant_admin', name: 'Plant Administration' },
+  { id: 'maint_mgr', name: 'Maintenance Manager' },
+  { id: 'mech', name: 'Mechanical Crew' },
+  { id: 'elec', name: 'Electrical Crew' },
+  { id: 'util', name: 'Utility Crew' },
+]
+const crewName = id => CREWS.find(c => c.id === id)?.name || '—'
+const defaultCrew = role => (role === 'admin' ? 'plant_admin' : role === 'manager' ? 'maint_mgr' : 'mech')
+
+/* ══════════════════════════════════════════════════════════════════════════
    GLOBAL STATE
    ══════════════════════════════════════════════════════════════════════════ */
 const Ctx = createContext(null)
@@ -127,11 +164,7 @@ function AppProvider({ children }) {
   const [err, setErr] = useState('')
 
   const role = profile?.role || 'technician'
-  const perms = {
-    viewAll: role !== 'technician', edit: role !== 'technician', create: role !== 'technician',
-    approve: ['admin', 'manager'].includes(role), manageAssets: ['admin', 'manager'].includes(role),
-    manageTG: ['admin', 'manager'].includes(role), manageUsers: role === 'admin',
-  }
+  const perms = permsFor(role)
 
   const rWOs = useCallback(async () => { try { setWorkOrders(await qWorkOrders()) } catch (e) { setErr(e.message) } }, [])
   const rAssets = useCallback(async () => { try { setAssets(await qAssets()) } catch (e) { setErr(e.message) } }, [])
@@ -418,32 +451,123 @@ function CreateWOModal({ onClose, prefill = null, onCreated = null }) {
 /* ══════════════════════════════════════════════════════════════════════════
    PAGES
    ══════════════════════════════════════════════════════════════════════════ */
-function DashboardPage() {
-  const { workOrders, users, assets } = useApp()
-  const [openWO, setOpenWO] = useState(null)
+/* Small shared row used by both dashboards' "This week" / "Open work" lists */
+function WORow({ w, assets, onOpen }) {
+  const a = assets.find(x => x.id === w.asset_id) || { name: '?', code: '' }
+  const t = TODAY()
+  const od = w.due_date && w.due_date < t
+  const total = w.wo_tasks?.length ?? 0
+  return (
+    <button onClick={() => onOpen(w)} className="flex items-center gap-3 px-4 py-3 w-full text-left border-t border-slate-100 hover:bg-slate-50">
+      <span className="w-1.5 h-9 rounded-full flex-shrink-0" style={{ background: PRIORITY_COLOR[w.priority] || '#94A3B8' }} />
+      <div className="flex-1 min-w-0">
+        <div className="font-bold text-sm truncate">#{w.id} · {w.title}</div>
+        <div className="text-xs text-slate-400 truncate">{a.name}{a.code ? ` (${a.code})` : ''} · due <span className={od ? 'text-red-600 font-bold' : ''}>{fmtDate(w.due_date)}</span></div>
+      </div>
+      <span className="text-xs text-slate-400 whitespace-nowrap">{doneCt(w)}/{total} tasks</span>
+      <Badge variant={w.priority}>{w.priority}</Badge>
+    </button>
+  )
+}
+
+function ManagerDashboard({ setOpenWO }) {
+  const { workOrders, users, assets, workReqs } = useApp()
   const t = TODAY()
   const open = workOrders.filter(w => w.status !== 'Closed')
   const closed = workOrders.filter(w => w.status === 'Closed')
   const overdue = open.filter(w => w.due_date && w.due_date < t)
   const onTime = closed.filter(w => w.closed_on && w.closed_on <= w.due_date)
   const comp = closed.length ? onTime.length / closed.length : 0
+  const highOpen = open.filter(w => w.priority === 'High')
+  const pendReq = workReqs.filter(r => r.status === 'Pending')
+  const backlog = open.reduce((s, w) => s + Math.max(estHrs(w) - spentHrs(w), 0), 0)
+  const totSpent = workOrders.reduce((s, w) => s + spentHrs(w), 0)
+  const totEst = workOrders.reduce((s, w) => s + estHrs(w), 0)
   const techs = users.filter(u => u.role === 'technician')
-  const week = [...open].sort((a, b) => (a.due_date || '') < (b.due_date || '') ? -1 : 1).slice(0, 8)
+  const weekEnd = (() => { const d = new Date(); d.setDate(d.getDate() + 7); return d.toISOString().slice(0, 10) })()
+  const week = open.filter(w => (w.status === 'In Progress') || (w.due_date && w.due_date <= weekEnd)).sort((a, b) => (a.due_date || '') < (b.due_date || '') ? -1 : 1).slice(0, 10)
   return (
-    <div className="p-6">
-      <h1 className="text-xl font-black mb-5">Dashboard</h1>
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-5">
-        <Card className="flex items-center gap-4 p-4 col-span-2"><div className="text-center"><GaugeSVG pct={comp} /><div className="text-xs text-slate-400">closed on time</div></div><div><div className="text-xs font-bold uppercase text-slate-400 mb-1">Schedule Compliance</div><div className="text-xs text-slate-400">{onTime.length} of {closed.length} closed on time</div></div></Card>
-        <Card className="flex items-center gap-4 p-4 col-span-2"><RingSVG n={overdue.length} total={workOrders.length} color="#B91C1C" /><div><div className="text-xs font-bold uppercase text-slate-400 mb-1">Overdue</div><div className="text-xs text-slate-400">{overdue.length} of {workOrders.length} total</div></div></Card>
-        <KPICard title="Open tickets" value={open.length} color="text-teal-700" />
-        <KPICard title="Closed" value={closed.length} color="text-slate-500" />
-        <KPICard title="PM tickets" value={workOrders.filter(isPM).length} color="text-teal-700" />
-        <KPICard title="Breakdowns" value={workOrders.filter(w => !isPM(w)).length} color="text-rose-700" />
+    <>
+      <div className="grid grid-cols-2 lg:grid-cols-5 gap-3 mb-3">
+        <Card className="flex items-center gap-3 p-4 col-span-2"><div className="text-center"><GaugeSVG pct={comp} /></div><div><div className="text-xs font-bold uppercase text-slate-400 mb-1 leading-tight">Schedule Compliance</div><div className="text-xs text-slate-400">{onTime.length} of {closed.length} closed WOs met their due date</div><div className="text-[11px] text-slate-400 mt-0.5">All assets & all groups</div></div></Card>
+        <Card className="flex items-center gap-3 p-4"><RingSVG n={overdue.length} total={workOrders.length} color="#B91C1C" /><div className="text-xs font-bold uppercase text-slate-400 leading-tight">Overdue<br />Work Orders</div></Card>
+        <KPICard title="High Priority Open" value={highOpen.length} color="text-red-600" />
+        <KPICard title="Open Work Orders" value={open.length} color="text-teal-700" />
+        <KPICard title="Work Requests Pending" value={pendReq.length} color="text-amber-600" />
+        <KPICard title="Closed Work Orders" value={closed.length} color="text-slate-500" />
+        <KPICard title="Backlog (est)" value={`${backlog.toFixed(1)} h`} />
+        <KPICard title="Hours: Spent vs Est" value={`${totSpent.toFixed(1)} / ${totEst.toFixed(1)} h`} color="text-blue-700" />
       </div>
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <Card><CardHead>Open work</CardHead>{week.length === 0 ? <p className="px-4 py-6 text-sm text-slate-400">Nothing open. Create a ticket to begin.</p> : week.map(w => { const a = assets.find(x => x.id === w.asset_id) || { name: '?' }; const od = w.due_date && w.due_date < t; return <button key={w.id} onClick={() => setOpenWO(w)} className="flex items-center gap-3 px-4 py-3 w-full text-left border-t border-slate-100 hover:bg-slate-50"><span className="w-1.5 h-8 rounded-full flex-shrink-0" style={{ background: PRIORITY_COLOR[w.priority] }} /><div className="flex-1 min-w-0"><div className="font-bold text-sm truncate">#{w.id} · {w.title}</div><div className="text-xs text-slate-400">{a.name} · due <span className={od ? 'text-red-600 font-bold' : ''}>{fmtDate(w.due_date)}</span></div></div><span className="text-xs text-slate-400">{doneCt(w)}/{w.wo_tasks?.length ?? 0}</span><KindBadge wo={w} /></button> })}</Card>
-        <Card><CardHead>Workload by technician</CardHead>{techs.length === 0 ? <p className="px-4 py-4 text-sm text-slate-400">No technicians yet. Add users in Settings.</p> : techs.map(u => { const o = open.filter(w => w.assigned_to === u.id), od = o.filter(w => w.due_date && w.due_date < t); return <div key={u.id} className="flex items-center gap-3 px-4 py-2.5 border-t border-slate-100 text-sm"><div className="w-8 h-8 rounded-full text-white text-xs font-bold flex items-center justify-center flex-shrink-0" style={{ background: u.color || '#0F766E' }}>{u.initials || '?'}</div><span className="flex-1 truncate">{u.name}</span><span className="text-teal-700 font-bold">{o.length} open</span>{od.length ? <span className="text-red-600 font-bold">{od.length} overdue</span> : <span className="text-slate-400">on track</span>}</div> })}</Card>
+        <Card>
+          <CardHead>Workload by technician</CardHead>
+          {techs.length === 0 ? <p className="px-4 py-4 text-sm text-slate-400">No technicians yet. Add users in Settings.</p> : techs.map(u => {
+            const o = open.filter(w => w.assigned_to === u.id), od = o.filter(w => w.due_date && w.due_date < t)
+            return <div key={u.id} className="flex items-center gap-3 px-4 py-3 border-t border-slate-100 text-sm"><div className="w-8 h-8 rounded-full text-white text-xs font-bold flex items-center justify-center flex-shrink-0" style={{ background: u.color || '#0F766E' }}>{u.initials || '?'}</div><span className="flex-1 truncate">{u.name}</span><span className="text-teal-700 font-bold">{o.length} open</span>{od.length ? <span className="text-red-600 font-bold">{od.length} overdue</span> : <span className="text-slate-400">on track</span>}</div>
+          })}
+        </Card>
+        <Card>
+          <CardHead action={<span className="text-xs font-normal text-slate-400">{week.length} due or in progress</span>}>This week</CardHead>
+          {week.length === 0 ? <p className="px-4 py-6 text-sm text-slate-400">Nothing due this week.</p> : week.map(w => <WORow key={w.id} w={w} assets={assets} onOpen={setOpenWO} />)}
+        </Card>
       </div>
+    </>
+  )
+}
+
+function TechnicianDashboard({ setOpenWO }) {
+  const { profile, workOrders, assets } = useApp()
+  const t = TODAY()
+  const mineAll = workOrders.filter(w => w.assigned_to === profile?.id)
+  const mineOpen = mineAll.filter(w => w.status !== 'Closed')
+  const mineOverdue = mineOpen.filter(w => w.due_date && w.due_date < t)
+  const inProg = mineOpen.filter(w => w.status === 'In Progress')
+  const myHrs = mineAll.reduce((s, w) => s + spentHrs(w), 0)
+  const closedThisWk = (() => { const d = new Date(); d.setDate(d.getDate() - 7); const c = d.toISOString().slice(0, 10); return mineAll.filter(w => w.status === 'Closed' && w.closed_on && w.closed_on >= c) })()
+  const weekEnd = (() => { const d = new Date(); d.setDate(d.getDate() + 7); return d.toISOString().slice(0, 10) })()
+  const todo = [...mineOpen].sort((a, b) => (a.due_date || '') < (b.due_date || '') ? -1 : 1)
+  const upcoming = todo.filter(w => !(w.due_date && w.due_date <= weekEnd))
+  return (
+    <>
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
+        <KPICard title="My Open Tickets" value={mineOpen.length} color="text-teal-700" />
+        <KPICard title="My Overdue" value={mineOverdue.length} color={mineOverdue.length ? 'text-red-600' : 'text-slate-500'} />
+        <KPICard title="In Progress" value={inProg.length} color="text-blue-700" />
+        <KPICard title="Hours Logged" value={`${myHrs.toFixed(1)} h`} sub={`${closedThisWk.length} closed in last 7 days`} />
+      </div>
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <Card>
+          <CardHead action={<span className="text-xs font-normal text-slate-400">{todo.length} assigned to you</span>}>My work — do next</CardHead>
+          {todo.length === 0 ? <p className="px-4 py-6 text-sm text-slate-400">Nothing assigned to you right now. 🎉</p> : todo.slice(0, 8).map(w => <WORow key={w.id} w={w} assets={assets} onOpen={setOpenWO} />)}
+        </Card>
+        <Card>
+          <CardHead>Later / upcoming</CardHead>
+          {upcoming.length === 0 ? <p className="px-4 py-6 text-sm text-slate-400">Nothing scheduled beyond this week.</p> : upcoming.slice(0, 8).map(w => <WORow key={w.id} w={w} assets={assets} onOpen={setOpenWO} />)}
+        </Card>
+      </div>
+    </>
+  )
+}
+
+function DashboardPage() {
+  const { profile, perms, workOrders } = useApp()
+  const [openWO, setOpenWO] = useState(null)
+  const canManage = perms.viewAll // manager / admin
+  const [view, setView] = useState(canManage ? 'manager' : 'tech')
+  const Tab = ({ id, children }) => (
+    <button onClick={() => setView(id)} className={`px-4 py-2.5 text-sm font-bold border-b-2 -mb-px transition-colors ${view === id ? 'border-teal-600 text-teal-700' : 'border-transparent text-slate-400 hover:text-slate-600'}`}>{children}</button>
+  )
+  return (
+    <div className="p-6">
+      {canManage ? (
+        <div className="flex items-center gap-1 border-b border-slate-200 mb-5">
+          <Tab id="tech">Technician Dashboard</Tab>
+          <Tab id="manager">Manager Dashboard</Tab>
+        </div>
+      ) : (
+        <h1 className="text-xl font-black mb-5">My Dashboard</h1>
+      )}
+      {view === 'manager' && canManage ? <ManagerDashboard setOpenWO={setOpenWO} /> : <TechnicianDashboard setOpenWO={setOpenWO} />}
       {openWO && <WOModal wo={workOrders.find(w => w.id === openWO.id) || openWO} onClose={() => setOpenWO(null)} />}
     </div>
   )
@@ -520,18 +644,57 @@ function AssetsPage({ kind = 'all' }) {
   )
 }
 
+/* Build the human name for a master checklist, in the plant's house style:
+   "Mechanical <Freq> PM Checklist for <Area> <Machine>". Manufacturing and
+   Packing stay visibly separate because the area is baked into the name. */
+function masterTGName(cl) {
+  const e = MASTER.equipment.find(x => x.checklist === cl.id)
+  const where = e ? `${e.area} ${e.name}` : cl.name
+  return `Mechanical ${cl.freq || 'Monthly'} PM Checklist for ${where}`
+}
+// Insert one task group per master checklist. Skips names already present so it
+// is safe to run twice. Each row's tasks are flattened as "[sub-assembly] task".
+async function loadMasterTaskGroups(profile, onProgress) {
+  const { data: existing } = await supabase.from('task_groups').select('name').eq('plant_id', profile.plant_id)
+  const have = new Set((existing || []).map(g => g.name))
+  let added = 0, skipped = 0
+  for (const cl of MASTER.checklists) {
+    const name = masterTGName(cl)
+    if (have.has(name)) { skipped++; continue }
+    const e = MASTER.equipment.find(x => x.checklist === cl.id)
+    const items = []
+    cl.groups.forEach(g => g.tasks.forEach(t => items.push({ description: `[${g.name}] ${t}` })))
+    await saveTG({ plant_id: profile.plant_id, name, asset_hint: e ? e.name : cl.name }, items)
+    added++; onProgress(`Adding task groups… ${added}`)
+  }
+  return { added, skipped, total: MASTER.checklists.length }
+}
+
 function TaskGroupsPage() {
   const { profile, perms, taskGroups, rTGs } = useApp()
   const [editId, setEditId] = useState(null)
   const [d, setD] = useState(null)
+  const [loading, setLoading] = useState(false)
+  const [note, setNote] = useState('')
   const openEdit = g => { if (g === 'new') { setD({ id: undefined, name: '', asset_hint: '', task_group_items: [{ description: '', est_hrs: '' }] }); setEditId('new') } else { setD({ ...g, task_group_items: [...(g.task_group_items || []).map(t => ({ ...t }))] }); setEditId(g.id) } }
   const save = async () => { if (!d.name.trim()) { alert('Name it.'); return } const items = d.task_group_items.filter(t => t.description.trim()); if (!items.length) { alert('Add a task.'); return } await saveTG({ id: d.id, plant_id: profile.plant_id, name: d.name, asset_hint: d.asset_hint }, items); await rTGs(); setEditId(null); setD(null) }
   const del = async () => { if (confirm('Delete?')) { await delTG(d.id); await rTGs(); setEditId(null); setD(null) } }
+  const loadMaster = async () => {
+    if (!confirm(`Load the ${MASTER.checklists.length} master PM checklists from the plant check-sheets into Task Groups? Ones already present are skipped.`)) return
+    setLoading(true); setNote('Loading master check-sheets…')
+    try { const r = await loadMasterTaskGroups(profile, setNote); await rTGs(); setNote(`Done — ${r.added} task groups added${r.skipped ? `, ${r.skipped} already existed` : ''}.`) }
+    catch (e) { setNote('Failed: ' + (e.message || e)) }
+    setLoading(false)
+  }
   return (
     <div className="p-6">
-      <div className="flex items-center gap-3 mb-4"><h1 className="text-xl font-black">Task Groups</h1><div className="flex-1" />{perms.manageTG && <Btn variant="teal" onClick={() => openEdit('new')}>+ New task group</Btn>}</div>
-      <p className="text-sm text-slate-400 mb-4">Reusable checklists used by Scheduled Maintenance and new tickets.</p>
-      <Card>{taskGroups.length === 0 ? <p className="px-4 py-6 text-sm text-slate-400">No task groups yet.</p> : taskGroups.map(g => { const tot = (g.task_group_items || []).reduce((s, t) => s + (parseFloat(t.est_hrs) || 0), 0); return <button key={g.id} onClick={() => openEdit(g)} className="flex items-center gap-3 px-4 py-3 border-t border-slate-100 w-full text-left hover:bg-slate-50 text-sm"><div className="flex-1 min-w-0"><div className="font-bold truncate">{g.name}</div>{g.asset_hint && <div className="text-xs text-slate-400">For: {g.asset_hint}</div>}</div><span className="text-slate-400 text-xs w-16">{g.task_group_items?.length ?? 0} tasks</span><span className="text-slate-400 text-xs w-20">{tot ? tot.toFixed(2) + ' h' : '—'}</span><span className="text-teal-700 font-bold text-xs">Edit</span></button> })}</Card>
+      <div className="flex items-center gap-3 mb-4"><h1 className="text-xl font-black">Task Groups</h1><div className="flex-1" />
+        {perms.manageTG && <Btn variant="ghost" onClick={loadMaster} disabled={loading}>{loading ? 'Loading…' : '⤓ Load master checklists'}</Btn>}
+        {perms.manageTG && <Btn variant="teal" onClick={() => openEdit('new')}>+ New task group</Btn>}
+      </div>
+      <p className="text-sm text-slate-400 mb-4">Reusable checklists used by Scheduled Maintenance and new tickets. “Load master checklists” pulls every PM check-sheet (Manufacturing &amp; Packing, kept separate) straight from the plant master data.</p>
+      {note && <Note variant={note.startsWith('Failed') ? 'red' : note.startsWith('Done') ? 'grey' : 'amber'}>{note}</Note>}
+      <Card>{taskGroups.length === 0 ? <p className="px-4 py-6 text-sm text-slate-400">No task groups yet. Use “Load master checklists” to import them from the plant check-sheets.</p> : taskGroups.map(g => { const tot = (g.task_group_items || []).reduce((s, t) => s + (parseFloat(t.est_hrs) || 0), 0); return <button key={g.id} onClick={() => openEdit(g)} className="flex items-center gap-3 px-4 py-3 border-t border-slate-100 w-full text-left hover:bg-slate-50 text-sm"><div className="flex-1 min-w-0"><div className="font-bold truncate">{g.name}</div>{g.asset_hint && <div className="text-xs text-slate-400">For: {g.asset_hint}</div>}</div><span className="text-slate-400 text-xs w-16">{g.task_group_items?.length ?? 0} tasks</span><span className="text-slate-400 text-xs w-20">{tot ? tot.toFixed(2) + ' h' : '—'}</span><span className="text-teal-700 font-bold text-xs">Edit</span></button> })}</Card>
       {editId && d && <Modal title={editId === 'new' ? 'New task group' : 'Edit task group'} onClose={() => { setEditId(null); setD(null) }} maxWidth="max-w-xl" footer={<div className="flex justify-between w-full">{editId !== 'new' ? <Btn variant="red" onClick={del}>Delete</Btn> : <span />}<div className="flex gap-2"><Btn variant="line" onClick={() => { setEditId(null); setD(null) }}>Cancel</Btn><Btn variant="teal" onClick={save}>Save</Btn></div></div>}>
         <div className="mb-3"><Lbl>Name</Lbl><Input value={d.name} onChange={e => setD(x => ({ ...x, name: e.target.value }))} placeholder="e.g. Electrical Monthly PM" /></div>
         <div className="mb-4"><Lbl>For asset / line (optional)</Lbl><Input value={d.asset_hint || ''} onChange={e => setD(x => ({ ...x, asset_hint: e.target.value }))} placeholder="e.g. Taping m/c" /></div>
@@ -674,15 +837,65 @@ function AssetInsightsPage() {
   )
 }
 
+function RolePermissionMatrix() {
+  return (
+    <Card className="p-4">
+      <div className="font-black text-sm mb-3">Role permission matrix</div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm border-collapse">
+          <thead>
+            <tr className="text-xs uppercase tracking-wide text-slate-400 font-bold">
+              <th className="text-left py-2 pr-4">Capability</th>
+              {ROLE_ORDER.map(r => <th key={r} className="text-left py-2 px-4 whitespace-nowrap">{ROLES[r]}</th>)}
+            </tr>
+          </thead>
+          <tbody>
+            {PERM_ROWS.map(row => (
+              <tr key={row.key} className="border-t border-slate-100">
+                <td className="py-2.5 pr-4 text-slate-700">{row.label}</td>
+                {ROLE_ORDER.map(r => (
+                  <td key={r} className="py-2.5 px-4">
+                    {ROLE_MATRIX[r][row.key] ? <span className="text-teal-600 font-black">✓</span> : <span className="text-slate-300">—</span>}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p className="text-xs text-slate-400 mt-4 leading-relaxed">Everyone can submit work and purchase requests, and fill checklists on their own work orders. Closing requires every task ticked with hours — no exceptions.</p>
+    </Card>
+  )
+}
+
 function UsersPage() {
   const { users, profile, rUsers } = useApp()
-  const ROLES = { admin: 'Administrator', manager: 'Maintenance Manager', technician: 'Technician' }
   const PLANTS = [{ id: 'p1', name: 'Uluberia' }, { id: 'p2', name: 'Manpura' }, { id: 'p3', name: 'Haridwar' }]
+  const isAdmin = profile?.role === 'admin'
   const [adding, setAdding] = useState(false)
-  const [f, setF] = useState({ email: '', password: '', name: '', role: 'technician', plant_id: profile?.plant_id || 'p1' })
+  const [f, setF] = useState({ email: '', password: '', name: '', role: 'technician', crew: 'mech', plant_id: profile?.plant_id || 'p1' })
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState('')
+  const [note, setNote] = useState('')
   const setRole = async (u, role) => { await supabase.from('profiles').update({ role }).eq('id', u.id); await rUsers() }
+  // "Group" = crew. Persisted to profiles.crew when that column exists; failures are surfaced, not swallowed.
+  const setCrew = async (u, crew) => {
+    const { error } = await supabase.from('profiles').update({ crew }).eq('id', u.id)
+    if (error) setNote('Groups need a "crew" text column on profiles. Add it in Supabase to persist this. (' + error.message + ')')
+    else { setNote(''); await rUsers() }
+  }
+  const resetPw = async u => {
+    if (!u.email) { setNote('No email on file for this user.'); return }
+    const { error } = await supabase.auth.resetPasswordForEmail(u.email)
+    setNote(error ? 'Reset failed: ' + error.message : `Password reset email sent to ${u.email}.`)
+  }
+  const removeUser = async u => {
+    if (u.id === profile?.id) { setNote("You can't remove yourself."); return }
+    if (!confirm(`Remove ${u.name}? This deletes their profile.`)) return
+    const { error } = await supabase.from('profiles').delete().eq('id', u.id)
+    setNote(error ? 'Remove failed: ' + error.message : `${u.name} removed.`)
+    await rUsers()
+  }
   const create = async () => {
     if (!f.email || !f.password || !f.name) { setMsg('Email, password and name are required.'); return }
     if (f.password.length < 6) { setMsg('Password must be at least 6 characters.'); return }
@@ -698,20 +911,38 @@ function UsersPage() {
       if (!res.ok) { setMsg(out.error || 'Failed.'); setBusy(false); return }
       await rUsers()
       setAdding(false)
-      setF({ email: '', password: '', name: '', role: 'technician', plant_id: profile?.plant_id || 'p1' })
+      setF({ email: '', password: '', name: '', role: 'technician', crew: 'mech', plant_id: profile?.plant_id || 'p1' })
     } catch (e) { setMsg(String(e.message || e)) }
     setBusy(false)
   }
   return (
     <div className="p-6">
-      <div className="flex items-center gap-3 mb-4"><h1 className="text-xl font-black">Users &amp; permissions</h1><div className="flex-1" />{profile?.role === 'admin' && <Btn variant="teal" onClick={() => { setAdding(true); setMsg('') }}>+ Add user</Btn>}</div>
-      <Card>{users.map(u => <div key={u.id} className="flex items-center gap-3 px-4 py-3 border-t border-slate-100 flex-wrap"><div className="w-8 h-8 rounded-full text-white text-xs font-bold flex items-center justify-center flex-shrink-0" style={{ background: u.color || '#0F766E' }}>{u.initials || '?'}</div><div className="flex-1 min-w-0"><div className="font-bold text-sm">{u.name}{u.id === profile?.id ? ' (you)' : ''}</div><div className="text-xs text-slate-400">{u.email || '—'}</div></div><Select value={u.role} onChange={e => setRole(u, e.target.value)} className="w-auto">{Object.entries(ROLES).map(([k, v]) => <option key={k} value={k}>{v}</option>)}</Select></div>)}</Card>
+      <div className="flex items-center gap-3 mb-4"><h1 className="text-xl font-black">Users &amp; permissions</h1><div className="flex-1" />{isAdmin && <Btn variant="teal" onClick={() => { setAdding(true); setMsg('') }}>+ Add user</Btn>}</div>
+      {note && <Note variant={note.includes('sent') || note.includes('removed') ? 'grey' : 'amber'}>{note}</Note>}
+      <Card className="mb-5">{users.map(u => {
+        const me = u.id === profile?.id
+        const crew = u.crew || defaultCrew(u.role)
+        return (
+          <div key={u.id} className="flex items-center gap-3 px-4 py-3 border-t border-slate-100 flex-wrap first:border-t-0">
+            <div className="w-9 h-9 rounded-full text-white text-xs font-bold flex items-center justify-center flex-shrink-0" style={{ background: u.color || '#0F766E' }}>{u.initials || '?'}</div>
+            <div className="flex-1 min-w-0"><div className="font-bold text-sm">{u.name}{me ? ' · you' : ''}</div><div className="text-xs text-slate-400">@{(u.email || '').split('@')[0] || '—'}</div></div>
+            <Select value={crew} onChange={e => setCrew(u, e.target.value)} disabled={!isAdmin} className="w-auto min-w-[170px]">{CREWS.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</Select>
+            <Select value={u.role} onChange={e => setRole(u, e.target.value)} disabled={!isAdmin || me} className="w-auto min-w-[170px]">{ROLE_ORDER.map(k => <option key={k} value={k}>{ROLES[k]}</option>)}</Select>
+            <Btn variant="line" className="text-xs py-1.5 px-3" onClick={() => resetPw(u)}>Reset password</Btn>
+            {isAdmin && !me && <Btn variant="red" className="text-xs py-1.5 px-3" onClick={() => removeUser(u)}>Remove</Btn>}
+          </div>
+        )
+      })}</Card>
+
+      <RolePermissionMatrix />
+
       {adding && <Modal title="Add user" onClose={() => setAdding(false)} maxWidth="max-w-md" footer={<><Btn variant="line" onClick={() => setAdding(false)}>Cancel</Btn><Btn variant="teal" onClick={create} disabled={busy}>{busy ? 'Creating…' : 'Create user'}</Btn></>}>
         {msg && <Note variant="red">{msg}</Note>}
         <div className="mb-3"><Lbl>Full name</Lbl><Input value={f.name} onChange={e => setF(o => ({ ...o, name: e.target.value }))} placeholder="e.g. Ramesh Kumar" /></div>
         <div className="mb-3"><Lbl>Email (login ID)</Lbl><Input type="email" value={f.email} onChange={e => setF(o => ({ ...o, email: e.target.value }))} placeholder="ramesh@itc.in" /></div>
         <div className="mb-3"><Lbl>Password (min 6 chars)</Lbl><Input type="text" value={f.password} onChange={e => setF(o => ({ ...o, password: e.target.value }))} placeholder="starter password" /></div>
-        <div className="grid grid-cols-2 gap-3"><Field label="Plant"><Select value={f.plant_id} onChange={e => setF(o => ({ ...o, plant_id: e.target.value }))}>{PLANTS.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</Select></Field><Field label="Role"><Select value={f.role} onChange={e => setF(o => ({ ...o, role: e.target.value }))}>{Object.entries(ROLES).map(([k, v]) => <option key={k} value={k}>{v}</option>)}</Select></Field></div>
+        <div className="grid grid-cols-2 gap-3 mb-3"><Field label="Plant"><Select value={f.plant_id} onChange={e => setF(o => ({ ...o, plant_id: e.target.value }))}>{PLANTS.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</Select></Field><Field label="Group"><Select value={f.crew} onChange={e => setF(o => ({ ...o, crew: e.target.value }))}>{CREWS.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</Select></Field></div>
+        <Field label="Role"><Select value={f.role} onChange={e => setF(o => ({ ...o, role: e.target.value, crew: defaultCrew(e.target.value) }))}>{ROLE_ORDER.map(k => <option key={k} value={k}>{ROLES[k]}</option>)}</Select></Field>
       </Modal>}
     </div>
   )
@@ -976,7 +1207,7 @@ function HistoryPage() {
    SHELL
    ══════════════════════════════════════════════════════════════════════════ */
 function Sidebar() {
-  const { profile, workReqs, purchReqs } = useApp()
+  const { profile, perms, workReqs, purchReqs } = useApp()
   const pendW = workReqs.filter(r => r.status === 'Pending').length
   const pendP = purchReqs.filter(r => r.status === 'Pending').length
   const Item = ({ to, icon, label, badge, sub }) => <NavLink to={to} end={to === '/'} className={({ isActive }) => `flex items-center gap-2.5 px-3 py-2 rounded-xl text-sm mb-0.5 ${sub ? 'ml-4' : ''} ${isActive ? 'bg-teal-800 text-white font-bold' : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'}`}><span className="w-4 text-center">{icon}</span><span className="flex-1">{label}</span>{badge ? <span className="bg-amber-500 text-white text-xs font-black rounded-full px-1.5 py-0.5">{badge}</span> : null}</NavLink>
